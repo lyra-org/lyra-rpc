@@ -35,12 +35,12 @@ pub const Playback = struct {
     playback_session_id: []const u8 = "",
     track_id: []const u8 = "",
     user_id: []const u8 = "",
-    position_ms: i64 = 0,
-    effective_position_ms: i64 = 0,
+    position_ms: u64 = 0,
+    effective_position_ms: u64 = 0,
     state: []const u8 = "",
-    activity_ms: i64 = 0,
-    updated_at_ms: i64 = 0,
-    duration_ms: ?i64 = null,
+    activity_ms: u64 = 0,
+    updated_at: []const u8 = "",
+    duration_ms: ?u64 = null,
 };
 
 pub const Artist = struct {
@@ -73,9 +73,17 @@ pub const Cover = struct {
 pub const Track = struct {
     id: []const u8 = "",
     title: []const u8 = "",
-    artists: []Artist = &.{},
-    releases: []Release = &.{},
+    artists: ?[]Artist = null,
+    releases: ?[]Release = null,
 };
+
+pub fn trackArtists(track: Track) []const Artist {
+    return track.artists orelse &.{};
+}
+
+pub fn trackReleases(track: Track) []const Release {
+    return track.releases orelse &.{};
+}
 
 pub fn loadConfig(allocator: Allocator, io: Io, path: []const u8) !Config {
     const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
@@ -140,7 +148,7 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
 }
 
 pub fn playbackLogLine(allocator: Allocator, state_label: []const u8, track: Track) ![]u8 {
-    const artist_names = try displayArtistNames(allocator, track.artists);
+    const artist_names = try displayArtistNames(allocator, trackArtists(track));
     defer allocator.free(artist_names);
 
     if (artist_names.len == 0) {
@@ -327,6 +335,29 @@ test "lookup paths use documented includes" {
     try std.testing.expectEqualStrings("/api/releases/release%2Fid?inc=covers", release_path);
 }
 
+test "playback decodes documented active session response" {
+    var playback = try std.json.parseFromSlice([]Playback, std.testing.allocator,
+        \\[{"playback_session_id":"session","track_id":"track","user_id":"user","position_ms":1200,"state":"playing","activity_ms":3400,"updated_at":"2026-05-11T07:00:00Z","effective_position_ms":1500,"duration_ms":3000,"supported_commands":["pause"],"remote_control_degraded":false}]
+    , api_json_parse_options);
+    defer playback.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), playback.value.len);
+    try std.testing.expectEqualStrings("2026-05-11T07:00:00Z", playback.value[0].updated_at);
+    try std.testing.expectEqual(@as(u64, 1500), playback.value[0].effective_position_ms);
+    try std.testing.expectEqual(@as(u64, 3000), playback.value[0].duration_ms.?);
+}
+
+test "track decodes nullable documented includes" {
+    var track = try std.json.parseFromSlice(Track, std.testing.allocator,
+        \\{"id":"track","title":"Song","artists":null,"releases":null,"duration_ms":null}
+    , api_json_parse_options);
+    defer track.deinit();
+
+    try std.testing.expectEqualStrings("Song", track.value.title);
+    try std.testing.expectEqual(@as(usize, 0), trackArtists(track.value).len);
+    try std.testing.expectEqual(@as(usize, 0), trackReleases(track.value).len);
+}
+
 test "release decodes documented cover response" {
     var release = try std.json.parseFromSlice(Release, std.testing.allocator,
         \\{"id":"rel","title":"Album","release_date":"2021-07-14","cover":{"id":"cov","url":"/api/covers/cov?v=hash","mime_type":"image/jpeg","hash":"hash","blurhash":null}}
@@ -348,5 +379,7 @@ test "API JSON strings do not borrow response body" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("Song", parsed.value.title);
-    try std.testing.expectEqualStrings("Artist", parsed.value.artists[0].name);
+    const artists = trackArtists(parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), artists.len);
+    try std.testing.expectEqualStrings("Artist", artists[0].name);
 }

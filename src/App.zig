@@ -58,7 +58,7 @@ cover_cache: std.StringHashMap([]u8),
 missing_cover_cache: std.StringHashMap(void),
 last_track_id: []u8 = &.{},
 last_state: []u8 = &.{},
-last_position_ms: i64 = 0,
+last_position_ms: u64 = 0,
 cached_track: ?std.json.Parsed(lyra.Track) = null,
 cached_image: []const u8 = "",
 playback_fetch_failed: bool = false,
@@ -389,8 +389,9 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
         self.cached_track = track;
         self.cached_image = "logo-dark";
 
-        if (self.config.images.uploader != .none and track.value.releases.len > 0) {
-            const url = self.uploadCover(track.value.releases[0].id) catch |err| blk: {
+        const releases = lyra.trackReleases(track.value);
+        if (self.config.images.uploader != .none and releases.len > 0) {
+            const url = self.uploadCover(releases[0].id) catch |err| blk: {
                 logError("Error uploading cover: {s}", .{@errorName(err)});
                 break :blk "";
             };
@@ -410,7 +411,7 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
     }
 
     const track = self.cachedTrack() orelse return error.MissingCachedTrack;
-    const artist_names = try lyra.displayArtistNames(self.allocator, track.artists);
+    const artist_names = try lyra.displayArtistNames(self.allocator, lyra.trackArtists(track.*));
     defer self.allocator.free(artist_names);
     const artists_text = try std.mem.join(self.allocator, ", ", artist_names);
     defer self.allocator.free(artists_text);
@@ -419,8 +420,9 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
     defer if (state_alloc) |value| self.allocator.free(value);
 
     var state_text: []const u8 = "";
-    if (track.releases.len > 0) {
-        const release = track.releases[0];
+    const releases = lyra.trackReleases(track.*);
+    if (releases.len > 0) {
+        const release = releases[0];
         const year = lyra.releaseYear(release);
         if (year.len != 0) {
             state_alloc = try std.fmt.allocPrint(self.allocator, "{s} ({s})", .{
@@ -444,16 +446,16 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
 
     if (std.mem.eql(u8, playback.state, "playing")) {
         var effective_ms = playback.effective_position_ms;
-        if (effective_ms <= 0) effective_ms = playback.position_ms;
+        if (effective_ms == 0) effective_ms = playback.position_ms;
         if (playback.duration_ms) |duration_ms| {
             if (effective_ms > duration_ms) effective_ms = duration_ms;
         }
 
-        const start_ms_i64 = snapshot_now.toMilliseconds() - effective_ms;
+        const start_ms_i64 = snapshot_now.toMilliseconds() - millisToSigned(effective_ms);
         const start_ms: u64 = @intCast(@max(start_ms_i64, 0));
         activity.timestamps = .{
             .start = start_ms,
-            .end = if (playback.duration_ms) |duration_ms| @as(u64, @intCast(@max(start_ms_i64 + duration_ms, 0))) else null,
+            .end = if (playback.duration_ms) |duration_ms| @as(u64, @intCast(@max(addMillisClamped(start_ms_i64, duration_ms), 0))) else null,
         };
         activity.assets.small_image = "playing";
         activity.assets.small_text = "Playing";
@@ -494,6 +496,18 @@ fn clearLastPlayback(self: *App) void {
     self.last_track_id = &.{};
     self.last_state = &.{};
     self.last_position_ms = 0;
+}
+
+fn millisToSigned(ms: u64) i64 {
+    return std.math.cast(i64, ms) orelse std.math.maxInt(i64);
+}
+
+fn addMillisClamped(base_ms: i64, offset_ms: u64) i64 {
+    const offset = millisToSigned(offset_ms);
+    if (base_ms > 0 and offset > std.math.maxInt(i64) - base_ms) {
+        return std.math.maxInt(i64);
+    }
+    return base_ms + offset;
 }
 
 fn logInfo(comptime format: []const u8, args: anytype) void {
