@@ -53,6 +53,7 @@ allocator: Allocator,
 io: Io,
 environ_map: *std.process.Environ.Map,
 config: lyra.Config,
+presence_release_includes: lyra.PresenceReleaseIncludes,
 http_client: std.http.Client,
 cover_cache: std.StringHashMap([]u8),
 missing_cover_cache: std.StringHashMap(void),
@@ -60,6 +61,8 @@ last_track_id: []u8 = &.{},
 last_state: []u8 = &.{},
 last_position_ms: u64 = 0,
 cached_track: ?std.json.Parsed(lyra.Track) = null,
+cached_release_details: ?std.json.Parsed(lyra.Release) = null,
+cached_release_details_failed: bool = false,
 cached_image: []const u8 = "",
 playback_fetch_failed: bool = false,
 discord: discord_mod.Client,
@@ -75,6 +78,7 @@ pub fn init(
         .io = io,
         .environ_map = environ_map,
         .config = config,
+        .presence_release_includes = lyra.presenceConfigReleaseIncludes(config.presence),
         .http_client = .{ .allocator = allocator, .io = io },
         .cover_cache = std.StringHashMap([]u8).init(allocator),
         .missing_cover_cache = std.StringHashMap(void).init(allocator),
@@ -187,6 +191,22 @@ fn fetchTrack(self: *App, id: []const u8) !std.json.Parsed(lyra.Track) {
 
 fn fetchReleaseWithCover(self: *App, id: []const u8) !std.json.Parsed(lyra.Release) {
     const path = try lyra.releaseCoverLookupPath(self.allocator, id);
+    defer self.allocator.free(path);
+
+    var resp = try self.lyraGet(path);
+    defer resp.deinit();
+
+    if (resp.status == .not_found) return error.ReleaseNotFound;
+    if (resp.status != .ok) return error.UnexpectedApiStatus;
+    return std.json.parseFromSlice(lyra.Release, self.allocator, resp.body, lyra.api_json_parse_options);
+}
+
+fn fetchReleaseDetails(
+    self: *App,
+    id: []const u8,
+    includes: lyra.ReleaseLookupIncludes,
+) !std.json.Parsed(lyra.Release) {
+    const path = try lyra.releaseLookupPath(self.allocator, id, includes);
     defer self.allocator.free(path);
 
     var resp = try self.lyraGet(path);
@@ -413,34 +433,52 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
     const track = self.cachedTrack() orelse return error.MissingCachedTrack;
     const artist_names = try lyra.displayArtistNames(self.allocator, lyra.trackArtists(track.*));
     defer self.allocator.free(artist_names);
-    const artists_text = try std.mem.join(self.allocator, ", ", artist_names);
+    const artists_text = try std.mem.join(self.allocator, self.config.presence.list_separator, artist_names);
     defer self.allocator.free(artists_text);
 
-    var state_alloc: ?[]u8 = null;
-    defer if (state_alloc) |value| self.allocator.free(value);
+    const release_includes = self.presence_release_includes;
+    const release = try self.presenceRelease(track.*, release_includes);
 
-    var state_text: []const u8 = "";
-    const releases = lyra.trackReleases(track.*);
-    if (releases.len > 0) {
-        const release = releases[0];
-        const year = lyra.releaseYear(release);
-        if (year.len != 0) {
-            state_alloc = try std.fmt.allocPrint(self.allocator, "{s} ({s})", .{
-                release.title,
-                year,
-            });
-            state_text = state_alloc.?;
-        } else {
-            state_text = release.title;
+    var release_artists_alloc: ?[]u8 = null;
+    defer if (release_artists_alloc) |value| self.allocator.free(value);
+    var release_artists_text: []const u8 = "";
+    if (release_includes.artists) {
+        if (release) |release_value| {
+            const release_artist_names = try lyra.displayArtistNames(self.allocator, lyra.releaseArtists(release_value));
+            defer self.allocator.free(release_artist_names);
+            release_artists_alloc = try std.mem.join(self.allocator, self.config.presence.list_separator, release_artist_names);
+            release_artists_text = release_artists_alloc.?;
         }
     }
 
+    var genres_alloc: ?[]u8 = null;
+    defer if (genres_alloc) |value| self.allocator.free(value);
+    var release_genres_text: []const u8 = "";
+    if (release_includes.genres) {
+        if (release) |release_value| {
+            const genres = lyra.releaseGenres(release_value);
+            if (genres.len != 0) {
+                genres_alloc = try std.mem.join(self.allocator, self.config.presence.list_separator, genres);
+                release_genres_text = genres_alloc.?;
+            }
+        }
+    }
+
+    var presence_text = try lyra.renderPresenceText(self.allocator, self.config.presence, .{
+        .track = track.*,
+        .release = release,
+        .artists = artists_text,
+        .release_artists = release_artists_text,
+        .release_genres = release_genres_text,
+    });
+    defer presence_text.deinit();
+
     var activity = discord_mod.Activity{
-        .details = track.title,
-        .state = state_text,
+        .details = presence_text.title,
+        .state = presence_text.subtitle,
         .assets = .{
             .large_image = self.cached_image,
-            .large_text = artists_text,
+            .large_text = presence_text.image_text,
         },
     };
 
@@ -473,9 +511,39 @@ fn cachedTrack(self: *App) ?*lyra.Track {
     return null;
 }
 
+fn presenceRelease(
+    self: *App,
+    track: lyra.Track,
+    includes: lyra.PresenceReleaseIncludes,
+) !?lyra.Release {
+    const releases = lyra.trackReleases(track);
+    if (releases.len == 0) return null;
+    if (!includes.any()) return releases[0];
+    if (self.cached_release_details) |*cached| return cached.value;
+    if (self.cached_release_details_failed) return releases[0];
+
+    const parsed = self.fetchReleaseDetails(releases[0].id, .{
+        .artists = includes.artists,
+        .genres = includes.genres,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            logError("Error fetching release details: {s}", .{@errorName(err)});
+            self.cached_release_details_failed = true;
+            return releases[0];
+        },
+    };
+
+    self.cached_release_details = parsed;
+    return self.cached_release_details.?.value;
+}
+
 fn clearCachedTrack(self: *App) void {
     if (self.cached_track) |cached| cached.deinit();
     self.cached_track = null;
+    if (self.cached_release_details) |cached| cached.deinit();
+    self.cached_release_details = null;
+    self.cached_release_details_failed = false;
 }
 
 fn rememberPlayback(self: *App, playback: lyra.Playback) !void {

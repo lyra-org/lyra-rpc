@@ -29,11 +29,49 @@ Optionally create a `config.json` in the working directory:
   "images": {
     "uploader": "none",
     "imgur_client_id": ""
+  },
+  "presence": {
+    "title": "{track.title}",
+    "subtitle": "{release.title} ({release.year})",
+    "image_text": "{artists}",
+    "list_separator": ", "
   }
 }
 ```
 
 `images.uploader` may be `none`, `litterbox`, or `imgur`. Set `images.imgur_client_id` when using `imgur`.
+
+### Presence text
+
+`presence` controls the text shown in Discord:
+
+| Key | Discord location | Default |
+| --- | --- | --- |
+| `title` | First line, bolded | `{track.title}` |
+| `subtitle` | Second line | `{release.title} ({release.year})` |
+| `image_text` | Third line and large image hover text | `{artists}` |
+| `list_separator` | Joins list values | `, ` |
+
+Templates can mix hardcoded text with placeholders. For example, `"{release.title} ({release.year})"` renders as `Album (2024)`.
+
+Supported placeholders:
+
+| Placeholder | Value |
+| --- | --- |
+| `{track.title}` | Track title |
+| `{track.id}` | Track ID |
+| `{track.year}` | Track year |
+| `{track.disc}` | Disc number |
+| `{track.number}` | Track number |
+| `{track.duration}` | Track duration, formatted like `3:42` |
+| `{artists}` | Track artists, joined with `list_separator` |
+| `{release.title}` | Release title |
+| `{release.date}` | Full release date from Lyra |
+| `{release.year}` | Release year |
+| `{release.artists}` | Release artists, joined with `list_separator` |
+| `{release.genres}` | Release genres, joined with `list_separator` |
+
+Empty parenthesized groups are removed after rendering. With the default `subtitle`, a release without a year shows as `Album` instead of `Album ()`.
 
 ## License
 
