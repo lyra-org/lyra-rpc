@@ -71,9 +71,8 @@ pub const Client = struct {
 
     pub fn setActivity(self: *Client, activity: Activity) !void {
         if (!self.logged) return;
-        const nonce = try newNonce(self.allocator, self.io);
-        defer self.allocator.free(nonce);
-        const payload = try activityFrameJsonWithNonce(self.allocator, activity, nonce);
+        const nonce = newNonce(self.io);
+        const payload = try activityFrameJsonWithNonce(self.allocator, activity, &nonce);
         defer self.allocator.free(payload);
         const response = try self.send(1, payload);
         defer self.allocator.free(response);
@@ -82,25 +81,21 @@ pub const Client = struct {
 
     pub fn clearActivity(self: *Client) !void {
         if (!self.logged) return;
-        const nonce = try newNonce(self.allocator, self.io);
-        defer self.allocator.free(nonce);
-        const payload = try clearActivityFrameJsonWithNonce(self.allocator, nonce);
+        const nonce = newNonce(self.io);
+        const payload = try clearActivityFrameJsonWithNonce(self.allocator, &nonce);
         defer self.allocator.free(payload);
         const response = try self.send(1, payload);
         defer self.allocator.free(response);
         if (response.len == 0) return error.EmptyDiscordResponse;
     }
 
-    fn send(self: *Client, opcode: u32, payload: []const u8) ![]u8 {
+    fn send(self: *Client, opcode: u32, payload: []const u8) ![]const u8 {
         const conn = if (self.conn) |*conn| conn else return error.DiscordIpcNotConnected;
-        var frame = try self.allocator.alloc(u8, 8 + payload.len);
-        defer self.allocator.free(frame);
+        var header: [8]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], opcode, .little);
+        std.mem.writeInt(u32, header[4..8], @intCast(payload.len), .little);
 
-        std.mem.writeInt(u32, frame[0..4], opcode, .little);
-        std.mem.writeInt(u32, frame[4..8], @intCast(payload.len), .little);
-        @memcpy(frame[8..], payload);
-
-        try conn.writeAll(self.io, frame);
+        try conn.writeFrame(self.io, &header, payload);
         return conn.readFrame(self.allocator, self.io);
     }
 };
@@ -133,37 +128,46 @@ const IpcConn = union(enum) {
         }
     }
 
-    fn writeAll(self: *IpcConn, io: Io, data: []const u8) !void {
+    fn writeFrame(
+        self: *IpcConn,
+        io: Io,
+        header: []const u8,
+        payload: []const u8,
+    ) !void {
         var buffer: [1024]u8 = undefined;
         switch (self.*) {
             .stream => |stream| {
                 var writer = stream.writer(io, &buffer);
-                try writeAllWithWriter(&writer, data);
+                try writeFrameWithWriter(&writer, header, payload);
             },
             .file => |file| {
                 var writer = file.writerStreaming(io, &buffer);
-                try writeAllWithWriter(&writer, data);
+                try writeFrameWithWriter(&writer, header, payload);
             },
         }
     }
 
-    fn readFrame(self: *IpcConn, allocator: Allocator, io: Io) ![]u8 {
+    fn readFrame(self: *IpcConn, allocator: Allocator, io: Io) ![]const u8 {
         var buffer: [1024]u8 = undefined;
         switch (self.*) {
             .stream => |stream| {
                 var reader = stream.reader(io, &buffer);
-                return readFrameWithReader(&reader, allocator);
+                return readFrameWithReader(allocator, &reader);
             },
             .file => |file| {
                 var reader = file.readerStreaming(io, &buffer);
-                return readFrameWithReader(&reader, allocator);
+                return readFrameWithReader(allocator, &reader);
             },
         }
     }
 };
 
-fn writeAllWithWriter(writer: anytype, data: []const u8) !void {
-    writer.interface.writeAll(data) catch |err| {
+fn writeFrameWithWriter(writer: anytype, header: []const u8, payload: []const u8) !void {
+    writer.interface.writeAll(header) catch |err| {
+        if (err == error.WriteFailed) return writer.err orelse err;
+        return err;
+    };
+    writer.interface.writeAll(payload) catch |err| {
         if (err == error.WriteFailed) return writer.err orelse err;
         return err;
     };
@@ -173,12 +177,12 @@ fn writeAllWithWriter(writer: anytype, data: []const u8) !void {
     };
 }
 
-fn readFrameWithReader(reader: anytype, allocator: Allocator) ![]u8 {
+fn readFrameWithReader(allocator: Allocator, reader: anytype) ![]const u8 {
     var header: [8]u8 = undefined;
-    readExact(reader, &header) catch |err| return err;
+    try readExact(reader, &header);
 
     const length = std.mem.readInt(u32, header[4..8], .little);
-    if (length == 0) return allocator.dupe(u8, "");
+    if (length == 0) return "";
 
     const payload = try allocator.alloc(u8, length);
     errdefer allocator.free(payload);
@@ -366,7 +370,7 @@ fn processId() u32 {
     };
 }
 
-fn newNonce(allocator: Allocator, io: Io) ![]u8 {
+fn newNonce(io: Io) [36]u8 {
     var bytes: [16]u8 = undefined;
     io.random(&bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -383,12 +387,11 @@ fn newNonce(allocator: Allocator, io: Io) ![]u8 {
     @memcpy(out[19..23], hex[16..20]);
     out[23] = '-';
     @memcpy(out[24..36], hex[20..32]);
-    return allocator.dupe(u8, &out);
+    return out;
 }
 
 test "nonce is uuid v4 shaped" {
-    const nonce = try newNonce(std.testing.allocator, std.testing.io);
-    defer std.testing.allocator.free(nonce);
+    const nonce = newNonce(std.testing.io);
 
     try std.testing.expectEqual(@as(usize, 36), nonce.len);
     try std.testing.expectEqual(@as(u8, '-'), nonce[8]);
@@ -426,7 +429,11 @@ test "activity frame encodes Discord payload shape" {
     const normalized = try normalizePidForTest(std.testing.allocator, frame);
     defer std.testing.allocator.free(normalized);
     try std.testing.expectEqualStrings(
-        "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":0,\"activity\":{\"type\":2,\"details\":\"Track\",\"state\":\"Album (2024)\",\"assets\":{\"large_image\":\"logo-dark\",\"large_text\":\"Artist\",\"small_image\":\"playing\",\"small_text\":\"Playing\"},\"timestamps\":{\"start\":1000,\"end\":2000}}},\"nonce\":\"nonce\"}",
+        "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":0,\"activity\":{\"type\":2," ++
+            "\"details\":\"Track\",\"state\":\"Album (2024)\",\"assets\":{" ++
+            "\"large_image\":\"logo-dark\",\"large_text\":\"Artist\"," ++
+            "\"small_image\":\"playing\",\"small_text\":\"Playing\"}," ++
+            "\"timestamps\":{\"start\":1000,\"end\":2000}}},\"nonce\":\"nonce\"}",
         normalized,
     );
 }

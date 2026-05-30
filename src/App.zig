@@ -13,6 +13,9 @@ const Io = std.Io;
 
 const litterbox_api_url = "https://litterbox.catbox.moe/resources/internals/api.php";
 const imgur_api_url = "https://api.imgur.com/3/image";
+const seek_detection_threshold_ms = 2000;
+const multipart_boundary = "----lyra-rpc-zig-boundary";
+const multipart_content_type = "multipart/form-data; boundary=" ++ multipart_boundary;
 
 const ImgurResponse = struct {
     data: ImgurData = .{},
@@ -34,7 +37,6 @@ const HttpResponse = struct {
 };
 
 const ActivePlayback = struct {
-    status: std.http.Status = .ok,
     parsed: ?std.json.Parsed([]lyra.Playback) = null,
     playback: ?lyra.Playback = null,
 
@@ -53,15 +55,20 @@ allocator: Allocator,
 io: Io,
 environ_map: *std.process.Environ.Map,
 config: lyra.Config,
-presence_release_includes: lyra.PresenceReleaseIncludes,
+base_url: []const u8,
+auth_header: []const u8 = "",
+imgur_auth_header: []const u8 = "",
+presence_inputs: lyra.PresenceTemplateInputs,
 http_client: std.http.Client,
 cover_cache: std.StringHashMap([]u8),
 missing_cover_cache: std.StringHashMap(void),
 last_track_id: []u8 = &.{},
 last_state: []u8 = &.{},
-last_position_ms: u64 = 0,
+last_duration_ms: ?u64 = null,
+last_activity_start_ms: ?u64 = null,
 cached_track: ?std.json.Parsed(lyra.Track) = null,
 cached_release_details: ?std.json.Parsed(lyra.Release) = null,
+cached_release_details_includes: lyra.ReleaseLookupIncludes = .{},
 cached_release_details_failed: bool = false,
 cached_image: []const u8 = "",
 playback_fetch_failed: bool = false,
@@ -72,13 +79,28 @@ pub fn init(
     io: Io,
     environ_map: *std.process.Environ.Map,
     config: lyra.Config,
-) App {
+) !App {
+    const auth_header = if (config.auth_token.len > 0)
+        try std.fmt.allocPrint(allocator, "Bearer {s}", .{config.auth_token})
+    else
+        &.{};
+    errdefer if (auth_header.len > 0) allocator.free(auth_header);
+
+    const imgur_auth_header = if (config.images.uploader == .imgur and config.images.imgur_client_id.len > 0)
+        try std.fmt.allocPrint(allocator, "Client-ID {s}", .{config.images.imgur_client_id})
+    else
+        &.{};
+    errdefer if (imgur_auth_header.len > 0) allocator.free(imgur_auth_header);
+
     return .{
         .allocator = allocator,
         .io = io,
         .environ_map = environ_map,
         .config = config,
-        .presence_release_includes = lyra.presenceConfigReleaseIncludes(config.presence),
+        .base_url = std.mem.trimEnd(u8, config.base_url, "/"),
+        .auth_header = auth_header,
+        .imgur_auth_header = imgur_auth_header,
+        .presence_inputs = lyra.presenceConfigInputs(config.presence),
         .http_client = .{ .allocator = allocator, .io = io },
         .cover_cache = std.StringHashMap([]u8).init(allocator),
         .missing_cover_cache = std.StringHashMap(void).init(allocator),
@@ -105,12 +127,13 @@ pub fn deinit(self: *App) void {
     self.missing_cover_cache.deinit();
 
     self.http_client.deinit();
+    if (self.auth_header.len > 0) self.allocator.free(self.auth_header);
+    if (self.imgur_auth_header.len > 0) self.allocator.free(self.imgur_auth_header);
     self.* = undefined;
 }
 
 fn lyraGet(self: *App, path: []const u8) !HttpResponse {
-    const base = std.mem.trimEnd(u8, self.config.base_url, "/");
-    const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, path });
+    const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.base_url, path });
     defer self.allocator.free(url);
     return self.httpGet(url, true);
 }
@@ -128,13 +151,9 @@ fn httpGet(self: *App, url: []const u8, include_auth: bool) !HttpResponse {
     var body_writer: Io.Writer.Allocating = .init(self.allocator);
     defer body_writer.deinit();
 
-    var auth_value: ?[]u8 = null;
-    defer if (auth_value) |value| self.allocator.free(value);
-
     var request_headers: std.http.Client.Request.Headers = .{};
-    if (include_auth and self.config.auth_token.len > 0) {
-        auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.config.auth_token});
-        request_headers.authorization = .{ .override = auth_value.? };
+    if (include_auth and self.auth_header.len > 0) {
+        request_headers.authorization = .{ .override = self.auth_header };
     }
 
     const result = try self.http_client.fetch(.{
@@ -142,7 +161,6 @@ fn httpGet(self: *App, url: []const u8, include_auth: bool) !HttpResponse {
         .method = .GET,
         .response_writer = &body_writer.writer,
         .headers = request_headers,
-        .keep_alive = false,
     });
 
     return .{
@@ -153,25 +171,14 @@ fn httpGet(self: *App, url: []const u8, include_auth: bool) !HttpResponse {
 }
 
 fn fetchActivePlayback(self: *App) !ActivePlayback {
-    const active = try self.fetchPlaybackSessions("/api/playback-sessions/active");
-    if (active.status == .ok) return active;
-
-    if (active.status != .not_found and active.status != .method_not_allowed) {
-        return error.UnexpectedApiStatus;
-    }
-
-    const fallback = try self.fetchPlaybackSessions("/api/playback-sessions?active=true");
-    if (fallback.status != .ok) return error.UnexpectedApiStatus;
-    return fallback;
+    return self.fetchPlaybackSessions("/api/playback-sessions/active");
 }
 
 fn fetchPlaybackSessions(self: *App, path: []const u8) !ActivePlayback {
     var resp = try self.lyraGet(path);
     defer resp.deinit();
 
-    if (resp.status != .ok) {
-        return .{ .status = resp.status };
-    }
+    if (resp.status != .ok) return error.UnexpectedApiStatus;
 
     const parsed = try std.json.parseFromSlice([]lyra.Playback, self.allocator, resp.body, lyra.api_json_parse_options);
     const playback = if (parsed.value.len == 0) null else parsed.value[0];
@@ -187,18 +194,6 @@ fn fetchTrack(self: *App, id: []const u8) !std.json.Parsed(lyra.Track) {
 
     if (resp.status != .ok) return error.UnexpectedApiStatus;
     return std.json.parseFromSlice(lyra.Track, self.allocator, resp.body, lyra.api_json_parse_options);
-}
-
-fn fetchReleaseWithCover(self: *App, id: []const u8) !std.json.Parsed(lyra.Release) {
-    const path = try lyra.releaseCoverLookupPath(self.allocator, id);
-    defer self.allocator.free(path);
-
-    var resp = try self.lyraGet(path);
-    defer resp.deinit();
-
-    if (resp.status == .not_found) return error.ReleaseNotFound;
-    if (resp.status != .ok) return error.UnexpectedApiStatus;
-    return std.json.parseFromSlice(lyra.Release, self.allocator, resp.body, lyra.api_json_parse_options);
 }
 
 fn fetchReleaseDetails(
@@ -217,15 +212,18 @@ fn fetchReleaseDetails(
     return std.json.parseFromSlice(lyra.Release, self.allocator, resp.body, lyra.api_json_parse_options);
 }
 
-fn uploadCover(self: *App, release_id: []const u8) ![]const u8 {
+fn uploadCover(
+    self: *App,
+    release_id: []const u8,
+    includes: lyra.ReleaseLookupIncludes,
+) ![]const u8 {
     if (self.config.images.uploader == .none) return error.ImageUploadsDisabled;
     if (self.cover_cache.get(release_id)) |url| return url;
     if (self.missing_cover_cache.contains(release_id)) return "";
 
-    var release = try self.fetchReleaseWithCover(release_id);
-    defer release.deinit();
+    const release = try self.ensureReleaseDetails(release_id, includes.merge(.{ .covers = true }));
 
-    const cover = release.value.cover orelse {
+    const cover = release.cover orelse {
         try self.rememberMissingCover(release_id);
         return "";
     };
@@ -271,14 +269,9 @@ fn uploadToLitterbox(self: *App, image: []const u8) ![]u8 {
 }
 
 fn uploadToImgur(self: *App, image: []const u8) ![]u8 {
-    const auth = try std.fmt.allocPrint(self.allocator, "Client-ID {s}", .{
-        self.config.images.imgur_client_id,
-    });
-    defer self.allocator.free(auth);
-
     var resp = try self.postMultipart(imgur_api_url, &.{
         .{ .name = "type", .value = "file" },
-    }, "image", image, auth);
+    }, "image", image, self.imgur_auth_header);
     defer resp.deinit();
 
     if (resp.status != .ok) return error.UnexpectedApiStatus;
@@ -297,35 +290,29 @@ fn postMultipart(
     file_data: []const u8,
     authorization: ?[]const u8,
 ) !HttpResponse {
-    const boundary = "----lyra-rpc-zig-boundary";
     var payload_writer: Io.Writer.Allocating = .init(self.allocator);
     defer payload_writer.deinit();
 
     for (fields) |field| {
         try payload_writer.writer.print(
             "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n",
-            .{ boundary, field.name, field.value },
+            .{ multipart_boundary, field.name, field.value },
         );
     }
     try payload_writer.writer.print(
-        "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"cover.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n",
-        .{ boundary, file_field_name },
+        "--{s}\r\n" ++
+            "Content-Disposition: form-data; name=\"{s}\"; filename=\"cover.jpg\"\r\n" ++
+            "Content-Type: image/jpeg\r\n\r\n",
+        .{ multipart_boundary, file_field_name },
     );
     try payload_writer.writer.writeAll(file_data);
-    try payload_writer.writer.print("\r\n--{s}--\r\n", .{boundary});
+    try payload_writer.writer.print("\r\n--{s}--\r\n", .{multipart_boundary});
 
     const payload = try payload_writer.toOwnedSlice();
     defer self.allocator.free(payload);
 
-    const content_type = try std.fmt.allocPrint(
-        self.allocator,
-        "multipart/form-data; boundary={s}",
-        .{boundary},
-    );
-    defer self.allocator.free(content_type);
-
     var request_headers: std.http.Client.Request.Headers = .{
-        .content_type = .{ .override = content_type },
+        .content_type = .{ .override = multipart_content_type },
     };
     if (authorization) |value| request_headers.authorization = .{ .override = value };
 
@@ -338,7 +325,6 @@ fn postMultipart(
         .payload = payload,
         .response_writer = &response_writer.writer,
         .headers = request_headers,
-        .keep_alive = false,
     });
 
     return .{
@@ -351,7 +337,7 @@ fn postMultipart(
 pub fn poll(self: *App) void {
     var active_playback = self.fetchActivePlayback() catch |err| {
         if (!self.playback_fetch_failed) {
-            logLyraRequestError(self.config, "Error fetching playback", err);
+            logLyraRequestError("Error fetching playback", self.config, err);
             self.playback_fetch_failed = true;
         }
         return;
@@ -392,12 +378,8 @@ fn clearPresenceIfNeeded(self: *App) void {
 }
 
 fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestamp) !void {
-    if (std.mem.eql(u8, playback.track_id, self.last_track_id) and
-        std.mem.eql(u8, playback.state, self.last_state) and
-        playback.position_ms == self.last_position_ms)
-    {
-        return;
-    }
+    const timestamps = playbackTimestamps(playback, snapshot_now);
+    if (!self.shouldUpdatePresence(playback, timestamps)) return;
 
     if (!std.mem.eql(u8, playback.track_id, self.last_track_id)) {
         const track = self.fetchTrack(playback.track_id) catch |err| {
@@ -411,7 +393,10 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
 
         const releases = lyra.trackReleases(track.value);
         if (self.config.images.uploader != .none and releases.len > 0) {
-            const url = self.uploadCover(releases[0].id) catch |err| blk: {
+            const url = self.uploadCover(
+                releases[0].id,
+                self.presence_inputs.releaseLookupIncludes(),
+            ) catch |err| blk: {
                 logError("Error uploading cover: {s}", .{@errorName(err)});
                 break :blk "";
             };
@@ -431,22 +416,35 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
     }
 
     const track = self.cachedTrack() orelse return error.MissingCachedTrack;
-    const artist_names = try lyra.displayArtistNames(self.allocator, lyra.trackArtists(track.*));
-    defer self.allocator.free(artist_names);
-    const artists_text = try std.mem.join(self.allocator, self.config.presence.list_separator, artist_names);
-    defer self.allocator.free(artists_text);
+    const inputs = self.presence_inputs;
 
-    const release_includes = self.presence_release_includes;
-    const release = try self.presenceRelease(track.*, release_includes);
+    var artists_text_alloc: ?[]u8 = null;
+    defer if (artists_text_alloc) |value| self.allocator.free(value);
+    var artists_text: []const u8 = "";
+    if (inputs.track_artists) {
+        const artist_names = try lyra.displayArtistNames(self.allocator, lyra.trackArtists(track.*));
+        defer self.allocator.free(artist_names);
+        artists_text_alloc = try std.mem.join(self.allocator, self.config.presence.list_separator, artist_names);
+        artists_text = artists_text_alloc.?;
+    }
+
+    const release = try self.presenceRelease(track.*, inputs);
 
     var release_artists_alloc: ?[]u8 = null;
     defer if (release_artists_alloc) |value| self.allocator.free(value);
     var release_artists_text: []const u8 = "";
-    if (release_includes.artists) {
+    if (inputs.release_artists) {
         if (release) |release_value| {
-            const release_artist_names = try lyra.displayArtistNames(self.allocator, lyra.releaseArtists(release_value));
+            const release_artist_names = try lyra.displayArtistNames(
+                self.allocator,
+                lyra.releaseArtists(release_value),
+            );
             defer self.allocator.free(release_artist_names);
-            release_artists_alloc = try std.mem.join(self.allocator, self.config.presence.list_separator, release_artist_names);
+            release_artists_alloc = try std.mem.join(
+                self.allocator,
+                self.config.presence.list_separator,
+                release_artist_names,
+            );
             release_artists_text = release_artists_alloc.?;
         }
     }
@@ -454,7 +452,7 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
     var genres_alloc: ?[]u8 = null;
     defer if (genres_alloc) |value| self.allocator.free(value);
     var release_genres_text: []const u8 = "";
-    if (release_includes.genres) {
+    if (inputs.release_genres) {
         if (release) |release_value| {
             const genres = lyra.releaseGenres(release_value);
             if (genres.len != 0) {
@@ -473,7 +471,7 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
     });
     defer presence_text.deinit();
 
-    var activity = discord_mod.Activity{
+    var activity: discord_mod.Activity = .{
         .details = presence_text.title,
         .state = presence_text.subtitle,
         .assets = .{
@@ -482,19 +480,8 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
         },
     };
 
-    if (std.mem.eql(u8, playback.state, "playing")) {
-        var effective_ms = playback.effective_position_ms;
-        if (effective_ms == 0) effective_ms = playback.position_ms;
-        if (playback.duration_ms) |duration_ms| {
-            if (effective_ms > duration_ms) effective_ms = duration_ms;
-        }
-
-        const start_ms_i64 = snapshot_now.toMilliseconds() - millisToSigned(effective_ms);
-        const start_ms: u64 = @intCast(@max(start_ms_i64, 0));
-        activity.timestamps = .{
-            .start = start_ms,
-            .end = if (playback.duration_ms) |duration_ms| @as(u64, @intCast(@max(addMillisClamped(start_ms_i64, duration_ms), 0))) else null,
-        };
+    if (timestamps) |value| {
+        activity.timestamps = value;
         activity.assets.small_image = "playing";
         activity.assets.small_text = "Playing";
     } else {
@@ -502,8 +489,25 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
         activity.assets.small_text = "Paused";
     }
 
-    try self.rememberPlayback(playback);
     try self.discord.setActivity(activity);
+    try self.rememberPlayback(playback, timestamps);
+}
+
+fn shouldUpdatePresence(
+    self: *App,
+    playback: lyra.Playback,
+    timestamps: ?discord_mod.Timestamps,
+) bool {
+    if (!std.mem.eql(u8, playback.track_id, self.last_track_id)) return true;
+    if (!std.mem.eql(u8, playback.state, self.last_state)) return true;
+    if (playback.duration_ms != self.last_duration_ms) return true;
+
+    if (timestamps) |value| {
+        const last_start = self.last_activity_start_ms orelse return true;
+        if (absDiff(value.start, last_start) > seek_detection_threshold_ms) return true;
+    }
+
+    return false;
 }
 
 fn cachedTrack(self: *App) ?*lyra.Track {
@@ -514,18 +518,17 @@ fn cachedTrack(self: *App) ?*lyra.Track {
 fn presenceRelease(
     self: *App,
     track: lyra.Track,
-    includes: lyra.PresenceReleaseIncludes,
+    inputs: lyra.PresenceTemplateInputs,
 ) !?lyra.Release {
     const releases = lyra.trackReleases(track);
     if (releases.len == 0) return null;
+    if (!inputs.release) return null;
+
+    const includes = inputs.releaseLookupIncludes();
     if (!includes.any()) return releases[0];
-    if (self.cached_release_details) |*cached| return cached.value;
     if (self.cached_release_details_failed) return releases[0];
 
-    const parsed = self.fetchReleaseDetails(releases[0].id, .{
-        .artists = includes.artists,
-        .genres = includes.genres,
-    }) catch |err| switch (err) {
+    return self.ensureReleaseDetails(releases[0].id, includes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             logError("Error fetching release details: {s}", .{@errorName(err)});
@@ -533,29 +536,68 @@ fn presenceRelease(
             return releases[0];
         },
     };
+}
 
+fn ensureReleaseDetails(
+    self: *App,
+    release_id: []const u8,
+    includes: lyra.ReleaseLookupIncludes,
+) !lyra.Release {
+    if (self.cached_release_details) |*cached| {
+        if (self.cached_release_details_includes.contains(includes)) return cached.value;
+    }
+
+    const fetch_includes = self.cached_release_details_includes.merge(includes);
+    const parsed = try self.fetchReleaseDetails(release_id, fetch_includes);
+    self.clearCachedReleaseDetails();
     self.cached_release_details = parsed;
+    self.cached_release_details_includes = fetch_includes;
     return self.cached_release_details.?.value;
 }
 
 fn clearCachedTrack(self: *App) void {
     if (self.cached_track) |cached| cached.deinit();
     self.cached_track = null;
+    self.clearCachedReleaseDetails();
+}
+
+fn clearCachedReleaseDetails(self: *App) void {
     if (self.cached_release_details) |cached| cached.deinit();
     self.cached_release_details = null;
+    self.cached_release_details_includes = .{};
     self.cached_release_details_failed = false;
 }
 
-fn rememberPlayback(self: *App, playback: lyra.Playback) !void {
-    const next_track_id = try self.allocator.dupe(u8, playback.track_id);
-    errdefer self.allocator.free(next_track_id);
-    const next_state = try self.allocator.dupe(u8, playback.state);
-    errdefer self.allocator.free(next_state);
+fn rememberPlayback(
+    self: *App,
+    playback: lyra.Playback,
+    timestamps: ?discord_mod.Timestamps,
+) !void {
+    const track_changed = !std.mem.eql(u8, playback.track_id, self.last_track_id);
+    const state_changed = !std.mem.eql(u8, playback.state, self.last_state);
 
-    self.clearLastPlayback();
-    self.last_track_id = next_track_id;
-    self.last_state = next_state;
-    self.last_position_ms = playback.position_ms;
+    const next_track_id = if (track_changed)
+        try self.allocator.dupe(u8, playback.track_id)
+    else
+        null;
+    errdefer if (next_track_id) |value| self.allocator.free(value);
+
+    const next_state = if (state_changed)
+        try self.allocator.dupe(u8, playback.state)
+    else
+        null;
+    errdefer if (next_state) |value| self.allocator.free(value);
+
+    if (next_track_id) |value| {
+        self.allocator.free(self.last_track_id);
+        self.last_track_id = value;
+    }
+    if (next_state) |value| {
+        self.allocator.free(self.last_state);
+        self.last_state = value;
+    }
+    self.last_duration_ms = playback.duration_ms;
+    self.last_activity_start_ms = if (timestamps) |value| value.start else null;
 }
 
 fn clearLastPlayback(self: *App) void {
@@ -563,7 +605,36 @@ fn clearLastPlayback(self: *App) void {
     self.allocator.free(self.last_state);
     self.last_track_id = &.{};
     self.last_state = &.{};
-    self.last_position_ms = 0;
+    self.last_duration_ms = null;
+    self.last_activity_start_ms = null;
+}
+
+fn playbackTimestamps(
+    playback: lyra.Playback,
+    snapshot_now: Io.Timestamp,
+) ?discord_mod.Timestamps {
+    if (!std.mem.eql(u8, playback.state, "playing")) return null;
+
+    var effective_ms = playback.effective_position_ms;
+    if (effective_ms == 0) effective_ms = playback.position_ms;
+    if (playback.duration_ms) |duration_ms| {
+        if (effective_ms > duration_ms) effective_ms = duration_ms;
+    }
+
+    const start_ms_i64 = snapshot_now.toMilliseconds() - millisToSigned(effective_ms);
+    const start_ms: u64 = @intCast(@max(start_ms_i64, 0));
+    const end_ms = if (playback.duration_ms) |duration_ms|
+        @as(u64, @intCast(@max(addMillisClamped(start_ms_i64, duration_ms), 0)))
+    else
+        null;
+    return .{
+        .start = start_ms,
+        .end = end_ms,
+    };
+}
+
+fn absDiff(a: u64, b: u64) u64 {
+    return if (a > b) a - b else b - a;
 }
 
 fn millisToSigned(ms: u64) i64 {
@@ -578,6 +649,38 @@ fn addMillisClamped(base_ms: i64, offset_ms: u64) i64 {
     return base_ms + offset;
 }
 
+test "presence update detection skips normal playing progress" {
+    var app: App = undefined;
+    app.last_track_id = @constCast("track");
+    app.last_state = @constCast("playing");
+    app.last_duration_ms = 300_000;
+    app.last_activity_start_ms = 10_000;
+
+    try std.testing.expect(!app.shouldUpdatePresence(.{
+        .track_id = "track",
+        .state = "playing",
+        .duration_ms = 300_000,
+    }, .{ .start = 11_500 }));
+
+    try std.testing.expect(app.shouldUpdatePresence(.{
+        .track_id = "track",
+        .state = "playing",
+        .duration_ms = 300_000,
+    }, .{ .start = 12_001 }));
+
+    try std.testing.expect(app.shouldUpdatePresence(.{
+        .track_id = "track",
+        .state = "playing",
+        .duration_ms = 301_000,
+    }, .{ .start = 10_000 }));
+
+    try std.testing.expect(app.shouldUpdatePresence(.{
+        .track_id = "track",
+        .state = "paused",
+        .duration_ms = 300_000,
+    }, null));
+}
+
 fn logInfo(comptime format: []const u8, args: anytype) void {
     std.debug.print(format ++ "\n", args);
 }
@@ -586,12 +689,16 @@ fn logError(comptime format: []const u8, args: anytype) void {
     std.debug.print(format ++ "\n", args);
 }
 
-fn logLyraRequestError(config: lyra.Config, comptime label: []const u8, err: anyerror) void {
+fn logLyraRequestError(comptime label: []const u8, config: lyra.Config, err: anyerror) void {
     if (err == error.ConnectionRefused) {
-        logError("{s}: could not connect to Lyra at {s} (connection refused). Start Lyra, or update base_url in config.json.", .{
-            label,
-            std.mem.trimEnd(u8, config.base_url, "/"),
-        });
+        logError(
+            "{s}: could not connect to Lyra at {s} (connection refused). " ++
+                "Start Lyra, or update base_url in config.json.",
+            .{
+                label,
+                std.mem.trimEnd(u8, config.base_url, "/"),
+            },
+        );
         return;
     }
     logError("{s}: {s}", .{ label, @errorName(err) });

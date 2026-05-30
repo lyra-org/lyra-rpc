@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingImgurClientId;
     }
 
-    var app = App.init(init.gpa, init.io, init.environ_map, config);
+    var app = try App.init(init.gpa, init.io, init.environ_map, config);
     defer app.deinit();
 
     app.discord.login(discord.client_id) catch |err| {

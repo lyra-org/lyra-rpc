@@ -116,7 +116,7 @@ pub fn loadConfig(allocator: Allocator, io: Io, path: []const u8) !Config {
         .ignore_unknown_fields = true,
     });
 
-    var config = Config{};
+    var config: Config = .{};
     if (loaded.base_url.len != 0) config.base_url = loaded.base_url;
     config.auth_token = loaded.auth_token;
     if (loaded.poll_interval_sec > 0) config.poll_interval_sec = loaded.poll_interval_sec;
@@ -170,12 +170,17 @@ pub fn renderPresenceText(
     };
 }
 
-pub const PresenceReleaseIncludes = struct {
-    artists: bool = false,
-    genres: bool = false,
+pub const PresenceTemplateInputs = struct {
+    track_artists: bool = false,
+    release: bool = false,
+    release_artists: bool = false,
+    release_genres: bool = false,
 
-    pub fn any(self: PresenceReleaseIncludes) bool {
-        return self.artists or self.genres;
+    pub fn releaseLookupIncludes(self: PresenceTemplateInputs) ReleaseLookupIncludes {
+        return .{
+            .artists = self.release_artists,
+            .genres = self.release_genres,
+        };
     }
 };
 
@@ -209,10 +214,19 @@ const presence_placeholders = std.StaticStringMap(PresencePlaceholder).initCompt
     .{ "release.genres", .release_genres },
 });
 
-pub fn presenceConfigReleaseIncludes(config: PresenceConfig) PresenceReleaseIncludes {
+pub fn presenceConfigInputs(config: PresenceConfig) PresenceTemplateInputs {
+    const release_artists = presenceConfigUsesPlaceholder(config, .release_artists);
+    const release_genres = presenceConfigUsesPlaceholder(config, .release_genres);
+
     return .{
-        .artists = presenceConfigUsesPlaceholder(config, .release_artists),
-        .genres = presenceConfigUsesPlaceholder(config, .release_genres),
+        .track_artists = presenceConfigUsesPlaceholder(config, .artists),
+        .release = release_artists or
+            release_genres or
+            presenceConfigUsesPlaceholder(config, .release_title) or
+            presenceConfigUsesPlaceholder(config, .release_date) or
+            presenceConfigUsesPlaceholder(config, .release_year),
+        .release_artists = release_artists,
+        .release_genres = release_genres,
     };
 }
 
@@ -441,17 +455,26 @@ pub fn playbackLogLine(allocator: Allocator, state_label: []const u8, track: Tra
     const artist_names = try displayArtistNames(allocator, trackArtists(track));
     defer allocator.free(artist_names);
 
-    if (artist_names.len == 0) {
-        return std.fmt.allocPrint(allocator, "{s}: {s}", .{ state_label, track.title });
-    }
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
 
-    const artists = try std.mem.join(allocator, ", ", artist_names);
-    defer allocator.free(artists);
-    return std.fmt.allocPrint(allocator, "{s}: {s} - {s}", .{
-        state_label,
-        track.title,
-        artists,
-    });
+    try out.writer.print("{s}: {s}", .{ state_label, track.title });
+    if (artist_names.len > 0) {
+        try out.writer.writeAll(" - ");
+        try writeJoinedStrings(&out.writer, ", ", artist_names);
+    }
+    return out.toOwnedSlice();
+}
+
+fn writeJoinedStrings(
+    writer: *Io.Writer,
+    separator: []const u8,
+    values: []const []const u8,
+) !void {
+    for (values, 0..) |value, index| {
+        if (index > 0) try writer.writeAll(separator);
+        try writer.writeAll(value);
+    }
 }
 
 pub fn formatLyraRequestError(
@@ -495,9 +518,13 @@ pub fn formatApiStatusError(
 }
 
 pub fn trackLookupPath(allocator: Allocator, track_id: []const u8) ![]u8 {
-    const escaped = try pathEscapeAlloc(allocator, track_id);
-    defer allocator.free(escaped);
-    return std.fmt.allocPrint(allocator, "/api/tracks/{s}?inc=releases%2Cartists", .{escaped});
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.writeAll("/api/tracks/");
+    try writePathEscaped(&out.writer, track_id);
+    try out.writer.writeAll("?inc=releases%2Cartists");
+    return out.toOwnedSlice();
 }
 
 pub fn releaseCoverLookupPath(allocator: Allocator, release_id: []const u8) ![]u8 {
@@ -512,6 +539,24 @@ pub const ReleaseLookupIncludes = struct {
     artists: bool = false,
     covers: bool = false,
     genres: bool = false,
+
+    pub fn any(self: ReleaseLookupIncludes) bool {
+        return self.artists or self.covers or self.genres;
+    }
+
+    pub fn contains(self: ReleaseLookupIncludes, required: ReleaseLookupIncludes) bool {
+        return (!required.artists or self.artists) and
+            (!required.covers or self.covers) and
+            (!required.genres or self.genres);
+    }
+
+    pub fn merge(self: ReleaseLookupIncludes, other: ReleaseLookupIncludes) ReleaseLookupIncludes {
+        return .{
+            .artists = self.artists or other.artists,
+            .covers = self.covers or other.covers,
+            .genres = self.genres or other.genres,
+        };
+    }
 };
 
 pub fn releaseLookupPath(
@@ -519,13 +564,11 @@ pub fn releaseLookupPath(
     release_id: []const u8,
     includes: ReleaseLookupIncludes,
 ) ![]u8 {
-    const escaped = try pathEscapeAlloc(allocator, release_id);
-    defer allocator.free(escaped);
-
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try out.writer.print("/api/releases/{s}", .{escaped});
+    try out.writer.writeAll("/api/releases/");
+    try writePathEscaped(&out.writer, release_id);
     if (includes.artists or includes.covers or includes.genres) {
         try out.writer.writeAll("?inc=");
         var needs_separator = false;
@@ -549,8 +592,12 @@ pub fn releaseLookupPath(
 pub fn pathEscapeAlloc(allocator: Allocator, input: []const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try @as(std.Uri.Component, .{ .raw = input }).formatEscaped(&out.writer);
+    try writePathEscaped(&out.writer, input);
     return out.toOwnedSlice();
+}
+
+fn writePathEscaped(writer: *Io.Writer, input: []const u8) !void {
+    try @as(std.Uri.Component, .{ .raw = input }).formatEscaped(writer);
 }
 
 pub fn trimSpace(input: []const u8) []const u8 {
@@ -600,7 +647,7 @@ test "display artist names falls back to all names" {
 }
 
 test "playback log line includes artists" {
-    const track = Track{
+    const track: Track = .{
         .title = "Song",
         .artists = @constCast(&[_]Artist{
             .{ .name = "Artist One", .credit = .{ .type = "artist" } },
@@ -619,7 +666,7 @@ test "playback log line omits empty artist suffix" {
 }
 
 test "presence templates render configured text" {
-    const release = Release{
+    const release: Release = .{
         .title = "Album",
         .release_date = "2024-05-01",
     };
@@ -695,8 +742,37 @@ test "config decodes partial presence defaults" {
     try std.testing.expectEqualStrings(", ", parsed.value.presence.list_separator);
 }
 
+test "presence config input analysis tracks required placeholders" {
+    const defaults = presenceConfigInputs(.{});
+    try std.testing.expect(defaults.track_artists);
+    try std.testing.expect(defaults.release);
+    try std.testing.expect(!defaults.release_artists);
+    try std.testing.expect(!defaults.release_genres);
+
+    const hardcoded = presenceConfigInputs(.{
+        .title = "Lyra",
+        .subtitle = "Playing",
+        .image_text = "Music",
+    });
+    try std.testing.expect(!hardcoded.track_artists);
+    try std.testing.expect(!hardcoded.release);
+
+    const release_lists = presenceConfigInputs(.{
+        .subtitle = "{release.artists} / {release.genres}",
+    });
+    try std.testing.expect(release_lists.release);
+    try std.testing.expect(release_lists.release_artists);
+    try std.testing.expect(release_lists.release_genres);
+    try std.testing.expect(release_lists.releaseLookupIncludes().contains(.{
+        .artists = true,
+        .genres = true,
+    }));
+}
+
 test "format Lyra request error for connection refused" {
-    const raw_error = "dial_tcp failed for address localhost:4746\ntried addrs:\n\t[::1]:4746: net: socket error: 111; code: 111";
+    const raw_error = "dial_tcp failed for address localhost:4746\n" ++
+        "tried addrs:\n" ++
+        "\t[::1]:4746: net: socket error: 111; code: 111";
     const message = try formatLyraRequestError(
         std.testing.allocator,
         "http://localhost:4746/",
@@ -705,7 +781,8 @@ test "format Lyra request error for connection refused" {
     );
     defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings(
-        "could not connect to Lyra at http://localhost:4746 (connection refused). Start Lyra, or update base_url in config.json.",
+        "could not connect to Lyra at http://localhost:4746 (connection refused). " ++
+            "Start Lyra, or update base_url in config.json.",
         message,
     );
 }
@@ -772,7 +849,21 @@ test "lookup paths use documented includes" {
 
 test "playback decodes documented active session response" {
     var playback = try std.json.parseFromSlice([]Playback, std.testing.allocator,
-        \\[{"playback_session_id":"session","track_id":"track","user_id":"user","position_ms":1200,"state":"playing","activity_ms":3400,"updated_at":"2026-05-11T07:00:00Z","effective_position_ms":1500,"duration_ms":3000,"supported_commands":["pause"],"remote_control_degraded":false}]
+        \\[
+        \\  {
+        \\    "playback_session_id": "session",
+        \\    "track_id": "track",
+        \\    "user_id": "user",
+        \\    "position_ms": 1200,
+        \\    "state": "playing",
+        \\    "activity_ms": 3400,
+        \\    "updated_at": "2026-05-11T07:00:00Z",
+        \\    "effective_position_ms": 1500,
+        \\    "duration_ms": 3000,
+        \\    "supported_commands": ["pause"],
+        \\    "remote_control_degraded": false
+        \\  }
+        \\]
     , api_json_parse_options);
     defer playback.deinit();
 
@@ -784,7 +875,16 @@ test "playback decodes documented active session response" {
 
 test "track decodes nullable documented includes" {
     var track = try std.json.parseFromSlice(Track, std.testing.allocator,
-        \\{"id":"track","title":"Song","disc":2,"track":7,"year":2024,"artists":null,"releases":null,"duration_ms":222000}
+        \\{
+        \\  "id": "track",
+        \\  "title": "Song",
+        \\  "disc": 2,
+        \\  "track": 7,
+        \\  "year": 2024,
+        \\  "artists": null,
+        \\  "releases": null,
+        \\  "duration_ms": 222000
+        \\}
     , api_json_parse_options);
     defer track.deinit();
 
@@ -799,7 +899,27 @@ test "track decodes nullable documented includes" {
 
 test "release decodes documented cover response" {
     var release = try std.json.parseFromSlice(Release, std.testing.allocator,
-        \\{"id":"rel","title":"Album","release_date":"2021-07-14","cover":{"id":"cov","url":"/api/covers/cov?v=hash","mime_type":"image/jpeg","hash":"hash","blurhash":null},"artists":[{"name":"Release Artist","credit":{"type":"artist"}}],"genres":["Rock","Pop"]}
+        \\{
+        \\  "id": "rel",
+        \\  "title": "Album",
+        \\  "release_date": "2021-07-14",
+        \\  "cover": {
+        \\    "id": "cov",
+        \\    "url": "/api/covers/cov?v=hash",
+        \\    "mime_type": "image/jpeg",
+        \\    "hash": "hash",
+        \\    "blurhash": null
+        \\  },
+        \\  "artists": [
+        \\    {
+        \\      "name": "Release Artist",
+        \\      "credit": {
+        \\        "type": "artist"
+        \\      }
+        \\    }
+        \\  ],
+        \\  "genres": ["Rock", "Pop"]
+        \\}
     , api_json_parse_options);
     defer release.deinit();
     const cover = release.value.cover orelse return error.TestExpectedCover;
