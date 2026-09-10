@@ -39,10 +39,24 @@ pub const Config = struct {
     presence: PresenceConfig = .{},
 };
 
+pub const PlaybackPage = struct {
+    items: []Playback,
+    next_cursor: ?[]const u8,
+
+    pub fn firstCurrent(self: PlaybackPage) ?CurrentPlayback {
+        for (self.items) |playback| {
+            if (playback.current) |current| return current;
+        }
+        return null;
+    }
+};
+
 pub const Playback = struct {
-    playback_session_id: []const u8 = "",
+    current: ?CurrentPlayback,
+};
+
+pub const CurrentPlayback = struct {
     track_id: []const u8 = "",
-    user_id: []const u8 = "",
     position_ms: u64 = 0,
     effective_position_ms: u64 = 0,
     state: []const u8 = "",
@@ -517,6 +531,18 @@ pub fn formatApiStatusError(
     });
 }
 
+pub fn activePlaybackPath(allocator: Allocator, cursor: ?[]const u8) ![]u8 {
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.writeAll("/api/playbacks?active=true");
+    if (cursor) |value| {
+        try out.writer.writeAll("&cursor=");
+        try writePathEscaped(&out.writer, value);
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn trackLookupPath(allocator: Allocator, track_id: []const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -776,7 +802,7 @@ test "format Lyra request error for connection refused" {
     const message = try formatLyraRequestError(
         std.testing.allocator,
         "http://localhost:4746/",
-        "http://localhost:4746/api/playback-sessions/active",
+        "http://localhost:4746/api/playbacks?active=true",
         raw_error,
     );
     defer std.testing.allocator.free(message);
@@ -847,30 +873,68 @@ test "lookup paths use documented includes" {
     try std.testing.expectEqualStrings("/api/releases/release%2Fid?inc=artists%2Ccovers%2Cgenres", release_full_path);
 }
 
-test "playback decodes documented active session response" {
-    var playback = try std.json.parseFromSlice([]Playback, std.testing.allocator,
-        \\[
-        \\  {
-        \\    "playback_session_id": "session",
-        \\    "track_id": "track",
-        \\    "user_id": "user",
-        \\    "position_ms": 1200,
-        \\    "state": "playing",
-        \\    "activity_ms": 3400,
-        \\    "updated_at": "2026-05-11T07:00:00Z",
-        \\    "effective_position_ms": 1500,
-        \\    "duration_ms": 3000,
-        \\    "supported_commands": ["pause"],
-        \\    "remote_control_degraded": false
-        \\  }
-        \\]
-    , api_json_parse_options);
-    defer playback.deinit();
+test "playback pages decode native and reported current playback" {
+    for ([_][]const u8{ "1", "null" }) |revision| {
+        const body = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"items":[{{"id":"context","user_id":"user","queue_revision":{s},
+            \\"updated_at":"2026-09-10T07:00:00Z","current":{{
+            \\"track_id":"track","position_ms":1200,"effective_position_ms":1500,
+            \\"duration_ms":3000,"state":"playing","activity_ms":3400,
+            \\"updated_at":"2026-09-10T07:00:00Z","client_name":"Player"
+            \\}}}}],"next_cursor":null}}
+        , .{revision});
+        defer std.testing.allocator.free(body);
+        const page = try std.json.parseFromSlice(PlaybackPage, std.testing.allocator, body, api_json_parse_options);
+        defer page.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), playback.value.len);
-    try std.testing.expectEqualStrings("2026-05-11T07:00:00Z", playback.value[0].updated_at);
-    try std.testing.expectEqual(@as(u64, 1500), playback.value[0].effective_position_ms);
-    try std.testing.expectEqual(@as(u64, 3000), playback.value[0].duration_ms.?);
+        const current = page.value.firstCurrent().?;
+        try std.testing.expectEqualStrings("track", current.track_id);
+        try std.testing.expectEqualStrings("playing", current.state);
+        try std.testing.expectEqual(@as(u64, 1200), current.position_ms);
+        try std.testing.expectEqual(@as(u64, 1500), current.effective_position_ms);
+        try std.testing.expectEqual(@as(u64, 3000), current.duration_ms.?);
+        try std.testing.expect(page.value.next_cursor == null);
+    }
+}
+
+test "playback pages preserve order and skip null current playback" {
+    const page = try std.json.parseFromSlice(PlaybackPage, std.testing.allocator,
+        \\{"items":[{"current":null},
+        \\{"current":{"track_id":"first","state":"paused","duration_ms":null}},
+        \\{"current":{"track_id":"second","state":"playing"}}],"next_cursor":"next"}
+    , api_json_parse_options);
+    defer page.deinit();
+
+    const current = page.value.firstCurrent().?;
+    try std.testing.expectEqualStrings("first", current.track_id);
+    try std.testing.expectEqualStrings("paused", current.state);
+    try std.testing.expect(current.duration_ms == null);
+    try std.testing.expectEqualStrings("next", page.value.next_cursor.?);
+}
+
+test "playback pages allow no current playback without hiding a cursor" {
+    for ([_][]const u8{
+        \\{"items":[],"next_cursor":null}
+        ,
+        \\{"items":[{"current":null}],"next_cursor":"next"}
+        ,
+    }) |body| {
+        const page = try std.json.parseFromSlice(PlaybackPage, std.testing.allocator, body, api_json_parse_options);
+        defer page.deinit();
+        try std.testing.expect(page.value.firstCurrent() == null);
+        if (page.value.items.len != 0) {
+            try std.testing.expectEqualStrings("next", page.value.next_cursor.?);
+        }
+    }
+}
+
+test "active playback paths preserve the filter and escape cursors" {
+    const first = try activePlaybackPath(std.testing.allocator, null);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("/api/playbacks?active=true", first);
+    const next = try activePlaybackPath(std.testing.allocator, "a+/=&?");
+    defer std.testing.allocator.free(next);
+    try std.testing.expectEqualStrings("/api/playbacks?active=true&cursor=a%2B%2F%3D%26%3F", next);
 }
 
 test "track decodes nullable documented includes" {

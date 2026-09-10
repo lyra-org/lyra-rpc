@@ -37,8 +37,8 @@ const HttpResponse = struct {
 };
 
 const ActivePlayback = struct {
-    parsed: ?std.json.Parsed([]lyra.Playback) = null,
-    playback: ?lyra.Playback = null,
+    parsed: ?std.json.Parsed(lyra.PlaybackPage) = null,
+    playback: ?lyra.CurrentPlayback = null,
 
     fn deinit(self: *ActivePlayback) void {
         if (self.parsed) |parsed| parsed.deinit();
@@ -171,18 +171,29 @@ fn httpGet(self: *App, url: []const u8, include_auth: bool) !HttpResponse {
 }
 
 fn fetchActivePlayback(self: *App) !ActivePlayback {
-    return self.fetchPlaybackSessions("/api/playback-sessions/active");
-}
+    var path = try lyra.activePlaybackPath(self.allocator, null);
+    defer self.allocator.free(path);
 
-fn fetchPlaybackSessions(self: *App, path: []const u8) !ActivePlayback {
-    var resp = try self.lyraGet(path);
-    defer resp.deinit();
+    while (true) {
+        var resp = try self.lyraGet(path);
+        defer resp.deinit();
+        if (resp.status != .ok) return error.UnexpectedApiStatus;
 
-    if (resp.status != .ok) return error.UnexpectedApiStatus;
-
-    const parsed = try std.json.parseFromSlice([]lyra.Playback, self.allocator, resp.body, lyra.api_json_parse_options);
-    const playback = if (parsed.value.len == 0) null else parsed.value[0];
-    return .{ .parsed = parsed, .playback = playback };
+        const parsed = try std.json.parseFromSlice(lyra.PlaybackPage, self.allocator, resp.body, lyra.api_json_parse_options);
+        errdefer parsed.deinit();
+        if (parsed.value.firstCurrent()) |playback| {
+            return .{ .parsed = parsed, .playback = playback };
+        }
+        const next_path = if (parsed.value.next_cursor) |cursor|
+            try lyra.activePlaybackPath(self.allocator, cursor)
+        else {
+            parsed.deinit();
+            return .{};
+        };
+        parsed.deinit();
+        self.allocator.free(path);
+        path = next_path;
+    }
 }
 
 fn fetchTrack(self: *App, id: []const u8) !std.json.Parsed(lyra.Track) {
@@ -377,7 +388,7 @@ fn clearPresenceIfNeeded(self: *App) void {
     self.cached_image = "";
 }
 
-fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestamp) !void {
+fn updatePresence(self: *App, playback: lyra.CurrentPlayback, snapshot_now: Io.Timestamp) !void {
     const timestamps = playbackTimestamps(playback, snapshot_now);
     if (!self.shouldUpdatePresence(playback, timestamps)) return;
 
@@ -495,7 +506,7 @@ fn updatePresence(self: *App, playback: lyra.Playback, snapshot_now: Io.Timestam
 
 fn shouldUpdatePresence(
     self: *App,
-    playback: lyra.Playback,
+    playback: lyra.CurrentPlayback,
     timestamps: ?discord_mod.Timestamps,
 ) bool {
     if (!std.mem.eql(u8, playback.track_id, self.last_track_id)) return true;
@@ -570,7 +581,7 @@ fn clearCachedReleaseDetails(self: *App) void {
 
 fn rememberPlayback(
     self: *App,
-    playback: lyra.Playback,
+    playback: lyra.CurrentPlayback,
     timestamps: ?discord_mod.Timestamps,
 ) !void {
     const track_changed = !std.mem.eql(u8, playback.track_id, self.last_track_id);
@@ -610,7 +621,7 @@ fn clearLastPlayback(self: *App) void {
 }
 
 fn playbackTimestamps(
-    playback: lyra.Playback,
+    playback: lyra.CurrentPlayback,
     snapshot_now: Io.Timestamp,
 ) ?discord_mod.Timestamps {
     if (!std.mem.eql(u8, playback.state, "playing")) return null;
