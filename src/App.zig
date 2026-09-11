@@ -46,6 +46,11 @@ const ActivePlayback = struct {
     }
 };
 
+const PlaybackResult = union(enum) {
+    active: ActivePlayback,
+    rejected: HttpResponse,
+};
+
 const MultipartField = struct {
     name: []const u8,
     value: []const u8,
@@ -170,25 +175,25 @@ fn httpGet(self: *App, url: []const u8, include_auth: bool) !HttpResponse {
     };
 }
 
-fn fetchActivePlayback(self: *App) !ActivePlayback {
+fn fetchActivePlayback(self: *App) !PlaybackResult {
     var path = try lyra.activePlaybackPath(self.allocator, null);
     defer self.allocator.free(path);
 
     while (true) {
         var resp = try self.lyraGet(path);
+        if (resp.status != .ok) return .{ .rejected = resp };
         defer resp.deinit();
-        if (resp.status != .ok) return error.UnexpectedApiStatus;
 
         const parsed = try std.json.parseFromSlice(lyra.PlaybackPage, self.allocator, resp.body, lyra.api_json_parse_options);
         errdefer parsed.deinit();
         if (parsed.value.firstCurrent()) |playback| {
-            return .{ .parsed = parsed, .playback = playback };
+            return .{ .active = .{ .parsed = parsed, .playback = playback } };
         }
         const next_path = if (parsed.value.next_cursor) |cursor|
             try lyra.activePlaybackPath(self.allocator, cursor)
         else {
             parsed.deinit();
-            return .{};
+            return .{ .active = .{} };
         };
         parsed.deinit();
         self.allocator.free(path);
@@ -346,12 +351,24 @@ fn postMultipart(
 }
 
 pub fn poll(self: *App) void {
-    var active_playback = self.fetchActivePlayback() catch |err| {
+    const result = self.fetchActivePlayback() catch |err| {
         if (!self.playback_fetch_failed) {
             logLyraRequestError("Error fetching playback", self.config, err);
             self.playback_fetch_failed = true;
         }
         return;
+    };
+    var active_playback = switch (result) {
+        .active => |active| active,
+        .rejected => |response| {
+            var resp = response;
+            defer resp.deinit();
+            if (!self.playback_fetch_failed) {
+                logApiStatusError("Error fetching playback", resp);
+                self.playback_fetch_failed = true;
+            }
+            return;
+        },
     };
     defer active_playback.deinit();
 
@@ -698,6 +715,14 @@ fn logInfo(comptime format: []const u8, args: anytype) void {
 
 fn logError(comptime format: []const u8, args: anytype) void {
     std.debug.print(format ++ "\n", args);
+}
+
+fn logApiStatusError(label: []const u8, response: HttpResponse) void {
+    logError("{f}", .{lyra.ApiStatusError{
+        .label = label,
+        .status_code = @intFromEnum(response.status),
+        .body = response.body,
+    }});
 }
 
 fn logLyraRequestError(comptime label: []const u8, config: lyra.Config, err: anyerror) void {

@@ -514,22 +514,28 @@ pub fn formatLyraRequestError(
     });
 }
 
-pub fn formatApiStatusError(
-    allocator: Allocator,
+pub const ApiStatusError = struct {
     label: []const u8,
     status_code: u16,
     body: []const u8,
-) ![]u8 {
-    const clean_body = trimSpace(body);
-    if (clean_body.len == 0) {
-        return std.fmt.allocPrint(allocator, "{s} returned status {}", .{ label, status_code });
+
+    pub fn format(self: ApiStatusError, writer: *Io.Writer) Io.Writer.Error!void {
+        var clean_body = trimSpace(self.body);
+        if (std.mem.startsWith(u8, clean_body, "Error:")) clean_body = trimSpace(clean_body[6..]);
+        const hint: []const u8 = switch (self.status_code) {
+            401 => "\nSet auth_token in config.json to a valid Lyra bearer token, then restart lyra-rpc.",
+            500...599 => "\nCheck the Lyra server logs for details.",
+            else => "",
+        };
+        try writer.print("{s}: HTTP {}{s}{s}{s}", .{
+            self.label,
+            self.status_code,
+            if (clean_body.len == 0) "" else ": ",
+            clean_body,
+            hint,
+        });
     }
-    return std.fmt.allocPrint(allocator, "{s} returned status {}: {s}", .{
-        label,
-        status_code,
-        clean_body,
-    });
-}
+};
 
 pub fn activePlaybackPath(allocator: Allocator, cursor: ?[]const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
@@ -828,21 +834,38 @@ test "format Lyra request error keeps unexpected context" {
 }
 
 test "format API status error" {
-    const with_body = try formatApiStatusError(
-        std.testing.allocator,
-        "tracks API",
-        400,
-        "Failed to deserialize query string: duplicate field `inc`\n",
+    try std.testing.expectFmt(
+        "tracks API: HTTP 400: Failed to deserialize query string: duplicate field `inc`",
+        "{f}",
+        .{ApiStatusError{
+            .label = "tracks API",
+            .status_code = 400,
+            .body = "Failed to deserialize query string: duplicate field `inc`\n",
+        }},
     );
-    defer std.testing.allocator.free(with_body);
-    try std.testing.expectEqualStrings(
-        "tracks API returned status 400: Failed to deserialize query string: duplicate field `inc`",
-        with_body,
+    try std.testing.expectFmt(
+        "tracks API: HTTP 500\nCheck the Lyra server logs for details.",
+        "{f}",
+        .{ApiStatusError{ .label = "tracks API", .status_code = 500, .body = "" }},
     );
-
-    const without_body = try formatApiStatusError(std.testing.allocator, "tracks API", 500, "");
-    defer std.testing.allocator.free(without_body);
-    try std.testing.expectEqualStrings("tracks API returned status 500", without_body);
+    try std.testing.expectFmt(
+        "Error fetching playback: HTTP 500: internal server error\nCheck the Lyra server logs for details.",
+        "{f}",
+        .{ApiStatusError{
+            .label = "Error fetching playback",
+            .status_code = 500,
+            .body = "Error: internal server error\n",
+        }},
+    );
+    try std.testing.expectFmt(
+        "Error fetching playback: HTTP 401: missing bearer credential\nSet auth_token in config.json to a valid Lyra bearer token, then restart lyra-rpc.",
+        "{f}",
+        .{ApiStatusError{
+            .label = "Error fetching playback",
+            .status_code = 401,
+            .body = "Error: missing bearer credential",
+        }},
+    );
 }
 
 test "lookup paths use documented includes" {
