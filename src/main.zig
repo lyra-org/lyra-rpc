@@ -7,35 +7,52 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const App = @import("App.zig");
+const Config = @import("Config.zig");
 const discord = @import("discord.zig");
-const lyra = @import("lyra.zig");
 
 const Io = std.Io;
 
-var shutdown_requested = std.atomic.Value(bool).init(false);
+const log = std.log.scoped(.main);
+
+pub const std_options: std.Options = .{
+    .log_level = switch (builtin.mode) {
+        .Debug => .debug,
+        else => .info,
+    },
+};
+
+/// Set by the signal handler; the poll loop checks it between sleeps.
+var shutdown_requested: std.atomic.Value(bool) = .init(false);
+
+const shutdown_poll_interval: Io.Duration = .fromMilliseconds(100);
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const config = lyra.loadConfig(arena, init.io, "config.json") catch |err| {
-        std.debug.print("Error loading config: {s}\n", .{@errorName(err)});
+    const config = Config.load(arena, init.io, "config.json") catch |err| {
+        switch (err) {
+            error.MissingImgurClientId => log.err(
+                "images.imgur_client_id is required when images.uploader is \"imgur\"",
+                .{},
+            ),
+            error.InvalidPresenceTemplate => log.err(
+                "presence templates contain an unknown placeholder or an unclosed brace",
+                .{},
+            ),
+            else => log.err("failed to load config.json err={}", .{err}),
+        }
         return err;
     };
-
-    if (config.images.uploader == .imgur and config.images.imgur_client_id.len == 0) {
-        std.debug.print("images.imgur_client_id is required when images.uploader is set to \"imgur\"\n", .{});
-        return error.MissingImgurClientId;
-    }
 
     var app = try App.init(init.gpa, init.io, init.environ_map, config);
     defer app.deinit();
 
     app.discord.login(discord.client_id) catch |err| {
-        std.debug.print("{s}\n", .{@errorName(err)});
+        log.err("failed to connect to Discord err={}", .{err});
         return err;
     };
 
     installSignalHandlers();
-    logInfo("Rich presence is running. Press Ctrl+C to exit.", .{});
+    log.info("rich presence is running, press Ctrl+C to exit", .{});
 
     app.poll();
     while (!shutdown_requested.load(.seq_cst)) {
@@ -43,15 +60,16 @@ pub fn main(init: std.process.Init) !void {
         if (shutdown_requested.load(.seq_cst)) break;
         app.poll();
     }
-    logInfo("Shutting down.", .{});
+    log.info("shutting down", .{});
 }
 
+/// Short sleeps keep shutdown responsive.
 fn sleepUntilNextPoll(io: Io, seconds: u32) void {
-    var remaining_ms: i64 = @as(i64, seconds) * std.time.ms_per_s;
-    while (remaining_ms > 0 and !shutdown_requested.load(.seq_cst)) {
-        const step_ms = @min(remaining_ms, 100);
-        Io.sleep(io, .fromMilliseconds(step_ms), .awake) catch return;
-        remaining_ms -= step_ms;
+    var remaining: Io.Duration = .fromSeconds(seconds);
+    while (remaining.nanoseconds > 0 and !shutdown_requested.load(.seq_cst)) {
+        const step: Io.Duration = .{ .nanoseconds = @min(remaining.nanoseconds, shutdown_poll_interval.nanoseconds) };
+        Io.sleep(io, step, .awake) catch return;
+        remaining.nanoseconds -= step.nanoseconds;
     }
 }
 
@@ -74,12 +92,13 @@ fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .seq_cst);
 }
 
-fn logInfo(comptime format: []const u8, args: anytype) void {
-    std.debug.print(format ++ "\n", args);
-}
-
 test {
+    // Zig 0.16 reports any stderr output during tests as a failed command,
+    // so keep log output down to errors while testing.
+    std.testing.log_level = .err;
     _ = App;
+    _ = Config;
     _ = discord;
-    _ = lyra;
+    _ = @import("lyra.zig");
+    _ = @import("presence.zig");
 }
