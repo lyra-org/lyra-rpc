@@ -19,6 +19,11 @@ const log = std.log.scoped(.app);
 const litterbox_api_url = "https://litterbox.catbox.moe/resources/internals/api.php";
 const imgur_api_url = "https://api.imgur.com/3/image";
 
+// Limits apply to decoded bodies, including chunked or compressed responses.
+const api_response_limit = 1024 * 1024;
+const cover_response_limit = 20 * 1024 * 1024;
+const upload_response_limit = 64 * 1024;
+
 const fallback_image = "logo-dark";
 
 /// A change in the computed activity start larger than this is treated
@@ -181,7 +186,29 @@ const ImgurResponse = struct {
     } = .{},
 };
 
-pub const HttpError = std.http.Client.FetchError || Allocator.Error;
+pub const HttpError = std.http.Client.FetchError || Allocator.Error || error{ResponseTooLarge};
+
+/// Checks each write before allowing the response buffer to grow.
+const ResponseWriter = struct {
+    writer: Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    body: Io.Writer.Allocating,
+    limit: usize,
+    too_large: bool = false,
+
+    fn drain(writer: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *ResponseWriter = @fieldParentPtr("writer", writer);
+        var remaining = self.limit - self.body.written().len;
+        for (data, 0..) |part, i| {
+            const repetitions = if (i == data.len - 1) splat else 1;
+            if (part.len != 0 and repetitions > remaining / part.len) {
+                self.too_large = true;
+                return error.WriteFailed;
+            }
+            remaining -= part.len * repetitions;
+        }
+        return self.body.writer.writeSplat(data, splat);
+    }
+};
 
 pub const ApiError = HttpError ||
     std.json.ParseError(std.json.Scanner) ||
@@ -290,7 +317,7 @@ pub fn poll(self: *App) void {
 fn lyraGet(self: *App, path: []const u8) HttpError!HttpResponse {
     const url = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ self.base_url, path });
     defer self.alloc.free(url);
-    return self.httpGet(url, true);
+    return self.httpGet(url, true, api_response_limit);
 }
 
 /// Credentials are only sent for paths, never to an arbitrary host.
@@ -298,25 +325,36 @@ fn lyraGetUrlOrPath(self: *App, url_or_path: []const u8) HttpError!HttpResponse 
     if (std.mem.startsWith(u8, url_or_path, "http://") or
         std.mem.startsWith(u8, url_or_path, "https://"))
     {
-        return self.httpGet(url_or_path, false);
+        return self.httpGet(url_or_path, false, cover_response_limit);
     }
-    return self.lyraGet(url_or_path);
+    const url = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ self.base_url, url_or_path });
+    defer self.alloc.free(url);
+    return self.httpGet(url, true, cover_response_limit);
 }
 
-fn httpGet(self: *App, url: []const u8, include_auth: bool) HttpError!HttpResponse {
-    var body_writer: Io.Writer.Allocating = .init(self.alloc);
-    defer body_writer.deinit();
+fn httpGet(self: *App, url: []const u8, include_auth: bool, limit: usize) HttpError!HttpResponse {
     var request_headers: std.http.Client.Request.Headers = .{};
     if (include_auth and self.auth_header.len > 0) {
         request_headers.authorization = .{ .override = self.auth_header };
     }
-    const result = try self.http_client.fetch(.{
+
+    return self.fetchBounded(.{
         .location = .{ .url = url },
         .method = .GET,
-        .response_writer = &body_writer.writer,
         .headers = request_headers,
-    });
-    return .{ .status = result.status, .body = try body_writer.toOwnedSlice() };
+    }, limit);
+}
+
+fn fetchBounded(self: *App, options: std.http.Client.FetchOptions, limit: usize) HttpError!HttpResponse {
+    var response_writer: ResponseWriter = .{ .body = .init(self.alloc), .limit = limit };
+    defer response_writer.body.deinit();
+    var bounded_options = options;
+    bounded_options.response_writer = &response_writer.writer;
+    const result = self.http_client.fetch(bounded_options) catch |err| {
+        if (response_writer.too_large) return error.ResponseTooLarge;
+        return err;
+    };
+    return .{ .status = result.status, .body = try response_writer.body.toOwnedSlice() };
 }
 
 fn fetchActivePlayback(self: *App) ApiError!PlaybackResult {
@@ -478,16 +516,12 @@ fn postMultipart(
     };
     if (authorization) |value| request_headers.authorization = .{ .override = value };
 
-    var response_writer: Io.Writer.Allocating = .init(self.alloc);
-    defer response_writer.deinit();
-    const result = try self.http_client.fetch(.{
+    return self.fetchBounded(.{
         .location = .{ .url = url },
         .method = .POST,
-        .response_writer = &response_writer.writer,
         .payload = payload_writer.written(),
         .headers = request_headers,
-    });
-    return .{ .status = result.status, .body = try response_writer.toOwnedSlice() };
+    }, upload_response_limit);
 }
 
 fn clearPresence(self: *App) void {
@@ -763,6 +797,44 @@ test "playbackTimestamps: playing derives start from position" {
     try std.testing.expectEqual(270_000, timestamps.end.?);
 
     try std.testing.expect(playbackTimestamps(.{ .state = .paused }, now) == null);
+}
+
+test "ResponseWriter bounds chunked HTTP bodies across writes" {
+    for ([_]usize{ 7, 8 }) |limit| {
+        var input: Io.Reader = .fixed(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n",
+        );
+        var http_reader: std.http.Reader = .{
+            .in = &input,
+            .interface = undefined,
+            .state = .ready,
+            .max_head_len = 1024,
+        };
+        _ = try http_reader.receiveHead();
+        var transfer_buffer: [3]u8 = undefined;
+        const body = http_reader.bodyReader(&transfer_buffer, .chunked, null);
+        var output: ResponseWriter = .{ .body = .init(std.testing.allocator), .limit = limit };
+        defer output.body.deinit();
+        if (limit == 8) {
+            try std.testing.expectEqual(8, try body.streamRemaining(&output.writer));
+            try std.testing.expectEqualStrings("abcdefgh", output.body.written());
+            try std.testing.expect(!output.too_large);
+        } else {
+            try std.testing.expectError(error.WriteFailed, body.streamRemaining(&output.writer));
+            try std.testing.expect(output.too_large);
+            try std.testing.expect(output.body.written().len <= limit);
+        }
+    }
+}
+
+test "ResponseWriter bounds repeated writes without allocating excess data" {
+    var output: ResponseWriter = .{ .body = .init(std.testing.allocator), .limit = 8 };
+    defer output.body.deinit();
+    try output.writer.writeAll("abcd");
+    try std.testing.expectError(error.WriteFailed, output.writer.splatByteAll('x', 5));
+    try std.testing.expect(output.too_large);
+    try std.testing.expectEqualStrings("abcd", output.body.written());
 }
 
 test "failed publication preserves last playback and keeps cache identity separate" {
