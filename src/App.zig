@@ -51,7 +51,11 @@ missing_cover_cache: std.StringHashMapUnmanaged(void) = .empty,
 
 last: LastPlayback = .{},
 
-/// Cached across play/pause changes to avoid refetching the track.
+/// Requested id of the cached track, independent of the last successful
+/// publication because fetching can succeed while publishing fails.
+cached_track_id: []u8 = &.{},
+
+/// Metadata for `cached_track_id`, retained across publication retries.
 cached_track: ?std.json.Parsed(lyra.Track) = null,
 
 release_details: ReleaseDetailsCache = .{},
@@ -503,9 +507,9 @@ fn updatePresence(self: *App, playback: lyra.CurrentPlayback, snapshot_now: Io.T
     if (!self.last.needsUpdate(playback, timestamps)) return;
 
     const track_changed = !std.mem.eql(u8, playback.track_id, self.last.track_id);
-    if (track_changed) try self.loadTrack(playback.track_id);
+    if (self.cachedTrack(playback.track_id) == null) try self.loadTrack(playback.track_id);
 
-    const track = self.cachedTrack() orelse return error.MissingCachedTrack;
+    const track = self.cachedTrack(playback.track_id) orelse return error.MissingCachedTrack;
     if (track_changed or playback.state != self.last.state) {
         const line = try lyra.playbackLogLine(self.alloc, playback.state, track.*);
         defer self.alloc.free(line);
@@ -560,14 +564,21 @@ fn updatePresence(self: *App, playback: lyra.CurrentPlayback, snapshot_now: Io.T
         activity.assets.small_text = lyra.PlaybackState.paused.label();
     }
 
+    // Prepare owned state before publishing so the commit cannot fail.
+    var next: LastPlayback = .{};
+    defer next.deinit(self.alloc);
+    try next.set(self.alloc, playback, timestamps);
     try self.discord.setActivity(activity);
-    try self.last.set(self.alloc, playback, timestamps);
+    std.mem.swap(LastPlayback, &self.last, &next);
 }
 
 /// A cover upload failure is logged and falls back to the default image.
 fn loadTrack(self: *App, track_id: []const u8) ApiError!void {
+    const owned_id = try self.alloc.dupe(u8, track_id);
+    errdefer self.alloc.free(owned_id);
     const track = try self.fetchTrack(track_id);
     self.clearCachedTrack();
+    self.cached_track_id = owned_id;
     self.cached_track = track;
 
     const releases = lyra.trackReleases(track.value);
@@ -590,7 +601,8 @@ fn joinArtistNames(self: *App, artists: []const lyra.Artist) Allocator.Error![]u
     return std.mem.join(self.alloc, self.config.presence.list_separator, names);
 }
 
-fn cachedTrack(self: *App) ?*lyra.Track {
+fn cachedTrack(self: *App, track_id: []const u8) ?*lyra.Track {
+    if (!std.mem.eql(u8, track_id, self.cached_track_id)) return null;
     if (self.cached_track) |*cached| return &cached.value;
     return null;
 }
@@ -634,6 +646,8 @@ fn ensureReleaseDetails(
 }
 
 fn clearCachedTrack(self: *App) void {
+    self.alloc.free(self.cached_track_id);
+    self.cached_track_id = &.{};
     if (self.cached_track) |cached| cached.deinit();
     self.cached_track = null;
     self.cached_image = fallback_image;
@@ -749,4 +763,44 @@ test "playbackTimestamps: playing derives start from position" {
     try std.testing.expectEqual(270_000, timestamps.end.?);
 
     try std.testing.expect(playbackTimestamps(.{ .state = .paused }, now) == null);
+}
+
+test "failed publication preserves last playback and keeps cache identity separate" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testFailedPublication, .{});
+}
+
+fn testFailedPublication(alloc: Allocator) !void {
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    var app = try App.init(alloc, std.testing.io, &environ, .{});
+    defer app.deinit();
+
+    try app.last.set(alloc, .{ .track_id = "A", .state = .playing }, .{ .start = 1000 });
+    app.cached_track = try std.json.parseFromSlice(lyra.Track, alloc,
+        \\{"id":"B","title":"Track B"}
+    , lyra.json_parse_options);
+    app.cached_track_id = try alloc.dupe(u8, "B");
+
+    // B was fetched, but Discord is disconnected. Reuse B without another
+    // HTTP fetch and leave the successfully published A unchanged.
+    const publication = app.updatePresence(
+        .{ .track_id = "B", .state = .paused },
+        .{ .nanoseconds = 0 },
+    );
+    if (publication) |_| {
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqualStrings("A", app.last.track_id);
+        try std.testing.expectEqual(.playing, app.last.state.?);
+        if (err == error.OutOfMemory or err == error.WriteFailed) return error.OutOfMemory;
+        try std.testing.expectEqual(error.NotConnected, err);
+    }
+    try std.testing.expectEqualStrings("A", app.last.track_id);
+    try std.testing.expectEqual(.playing, app.last.state.?);
+    try std.testing.expectEqual(1000, app.last.activity_start_ms.?);
+    try std.testing.expectEqualStrings("Track B", app.cachedTrack("B").?.title);
+
+    // Returning to A and pausing must fetch A, never render B under A's id.
+    try std.testing.expect(app.last.needsUpdate(.{ .track_id = "A", .state = .paused }, null));
+    try std.testing.expect(app.cachedTrack("A") == null);
 }
