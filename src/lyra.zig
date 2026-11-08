@@ -228,7 +228,7 @@ pub fn activePlaybackPath(alloc: Allocator, cursor: ?[]const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try out.writer.writeAll("/api/playbacks?active=true");
+    try out.writer.writeAll("/api/me/playbacks?active=true");
     if (cursor) |value| {
         try out.writer.writeAll("&cursor=");
         try writePathEscaped(&out.writer, value);
@@ -483,10 +483,10 @@ test "PlaybackState: unknown states decode instead of failing" {
 test "activePlaybackPath: preserves the filter and escapes cursors" {
     const first = try activePlaybackPath(std.testing.allocator, null);
     defer std.testing.allocator.free(first);
-    try std.testing.expectEqualStrings("/api/playbacks?active=true", first);
+    try std.testing.expectEqualStrings("/api/me/playbacks?active=true", first);
     const next = try activePlaybackPath(std.testing.allocator, "a+/=&?");
     defer std.testing.allocator.free(next);
-    try std.testing.expectEqualStrings("/api/playbacks?active=true&cursor=a%2B%2F%3D%26%3F", next);
+    try std.testing.expectEqualStrings("/api/me/playbacks?active=true&cursor=a%2B%2F%3D%26%3F", next);
 }
 
 test "Track: decodes nullable includes" {
