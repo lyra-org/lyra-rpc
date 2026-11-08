@@ -521,6 +521,8 @@ fn postMultipart(
         .method = .POST,
         .payload = payload_writer.written(),
         .headers = request_headers,
+        // Uploads are too infrequent to reuse a connection before the host closes it.
+        .keep_alive = false,
     }, upload_response_limit);
 }
 
