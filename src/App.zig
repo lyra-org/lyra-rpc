@@ -65,6 +65,9 @@ cached_track: ?std.json.Parsed(lyra.Track) = null,
 
 release_details: ReleaseDetailsCache = .{},
 
+/// Upload retry state for the cached track's cover.
+cover_retry: CoverRetry = .{},
+
 /// Borrows an uploaded URL from `cover_cache` or uses `fallback_image`.
 cached_image: []const u8 = fallback_image,
 
@@ -82,6 +85,9 @@ const LastPlayback = struct {
     duration_ms: ?u64 = null,
     activity_start_ms: ?u64 = null,
 
+    /// Published image, with the same lifetime as `App.cached_image`.
+    image: []const u8 = "",
+
     fn deinit(self: *LastPlayback, alloc: Allocator) void {
         alloc.free(self.track_id);
         self.* = undefined;
@@ -95,8 +101,10 @@ const LastPlayback = struct {
         self: LastPlayback,
         playback: lyra.CurrentPlayback,
         timestamps: ?discordpkg.Timestamps,
+        image: []const u8,
     ) bool {
         if (!std.mem.eql(u8, playback.track_id, self.track_id)) return true;
+        if (!std.mem.eql(u8, image, self.image)) return true;
         if (playback.state != self.state) return true;
         if (playback.duration_ms != self.duration_ms) return true;
 
@@ -113,6 +121,7 @@ const LastPlayback = struct {
         alloc: Allocator,
         playback: lyra.CurrentPlayback,
         timestamps: ?discordpkg.Timestamps,
+        image: []const u8,
     ) Allocator.Error!void {
         if (!std.mem.eql(u8, playback.track_id, self.track_id)) {
             const track_id = try alloc.dupe(u8, playback.track_id);
@@ -122,11 +131,39 @@ const LastPlayback = struct {
         self.state = playback.state;
         self.duration_ms = playback.duration_ms;
         self.activity_start_ms = if (timestamps) |value| value.start else null;
+        self.image = image;
     }
 
     fn clear(self: *LastPlayback, alloc: Allocator) void {
         alloc.free(self.track_id);
         self.* = .{};
+    }
+};
+
+/// Backs off between attempts and gives up after `max_retries`, so a rejected
+/// client id or rate limit is not hit on every poll.
+const CoverRetry = struct {
+    failures: u8 = 0,
+
+    /// Null when no retry is scheduled.
+    next_attempt_ms: ?i64 = null,
+
+    const max_retries = 5;
+    const base_delay_ms: i64 = 30 * std.time.ms_per_s;
+
+    fn due(self: CoverRetry, now: Io.Timestamp) bool {
+        const next_attempt_ms = self.next_attempt_ms orelse return false;
+        return now.toMilliseconds() >= next_attempt_ms;
+    }
+
+    fn recordFailure(self: *CoverRetry, now: Io.Timestamp) void {
+        if (self.failures >= max_retries) {
+            self.next_attempt_ms = null;
+            return;
+        }
+        const delay_ms = base_delay_ms << @intCast(self.failures);
+        self.failures += 1;
+        self.next_attempt_ms = now.toMilliseconds() +| delay_ms;
     }
 };
 
@@ -540,10 +577,13 @@ fn clearPresence(self: *App) void {
 
 fn updatePresence(self: *App, playback: lyra.CurrentPlayback, snapshot_now: Io.Timestamp) !void {
     const timestamps = playbackTimestamps(playback, snapshot_now);
-    if (!self.last.needsUpdate(playback, timestamps)) return;
+    if (self.cachedTrack(playback.track_id) != null and self.cover_retry.due(snapshot_now)) {
+        self.loadCover(snapshot_now);
+    }
+    if (!self.last.needsUpdate(playback, timestamps, self.cached_image)) return;
 
     const track_changed = !std.mem.eql(u8, playback.track_id, self.last.track_id);
-    if (self.cachedTrack(playback.track_id) == null) try self.loadTrack(playback.track_id);
+    if (self.cachedTrack(playback.track_id) == null) try self.loadTrack(playback.track_id, snapshot_now);
 
     const track = self.cachedTrack(playback.track_id) orelse return error.MissingCachedTrack;
     if (track_changed or playback.state != self.last.state) {
@@ -603,20 +643,25 @@ fn updatePresence(self: *App, playback: lyra.CurrentPlayback, snapshot_now: Io.T
     // Prepare owned state before publishing so the commit cannot fail.
     var next: LastPlayback = .{};
     defer next.deinit(self.alloc);
-    try next.set(self.alloc, playback, timestamps);
+    try next.set(self.alloc, playback, timestamps, self.cached_image);
     try self.discord.setActivity(activity);
     std.mem.swap(LastPlayback, &self.last, &next);
 }
 
-/// A cover upload failure is logged and falls back to the default image.
-fn loadTrack(self: *App, track_id: []const u8) ApiError!void {
+fn loadTrack(self: *App, track_id: []const u8, now: Io.Timestamp) ApiError!void {
     const owned_id = try self.alloc.dupe(u8, track_id);
     errdefer self.alloc.free(owned_id);
     const track = try self.fetchTrack(track_id);
     self.clearCachedTrack();
     self.cached_track_id = owned_id;
     self.cached_track = track;
+    self.loadCover(now);
+}
 
+/// A failed upload keeps the current image and schedules a retry unless the
+/// failure is permanent.
+fn loadCover(self: *App, now: Io.Timestamp) void {
+    const track = self.cached_track orelse return;
     const releases = lyra.trackReleases(track.value);
     if (self.config.images.uploader == .none or releases.len == 0) return;
 
@@ -625,8 +670,13 @@ fn loadTrack(self: *App, track_id: []const u8) ApiError!void {
         self.presence_inputs.releaseLookupIncludes(),
     ) catch |err| {
         log.err("error uploading cover err={}", .{err});
+        switch (err) {
+            error.ReleaseNotFound, error.ResponseTooLarge => self.cover_retry = .{},
+            else => self.cover_retry.recordFailure(now),
+        }
         return;
     };
+    self.cover_retry = .{};
     if (url.len != 0) self.cached_image = url;
 }
 
@@ -687,6 +737,7 @@ fn clearCachedTrack(self: *App) void {
     if (self.cached_track) |cached| cached.deinit();
     self.cached_track = null;
     self.cached_image = fallback_image;
+    self.cover_retry = .{};
     self.release_details.clear();
 }
 
@@ -736,37 +787,46 @@ test "LastPlayback.needsUpdate: skips normal playing progress" {
         .state = .playing,
         .duration_ms = 300_000,
         .activity_start_ms = 10_000,
+        .image = "cover",
     };
 
     try std.testing.expect(!last.needsUpdate(.{
         .track_id = "track",
         .state = .playing,
         .duration_ms = 300_000,
-    }, .{ .start = 11_500 }));
+    }, .{ .start = 11_500 }, "cover"));
 
     try std.testing.expect(last.needsUpdate(.{
         .track_id = "track",
         .state = .playing,
         .duration_ms = 300_000,
-    }, .{ .start = 12_001 }));
+    }, .{ .start = 12_001 }, "cover"));
 
     try std.testing.expect(last.needsUpdate(.{
         .track_id = "track",
         .state = .playing,
         .duration_ms = 301_000,
-    }, .{ .start = 10_000 }));
+    }, .{ .start = 10_000 }, "cover"));
 
     try std.testing.expect(last.needsUpdate(.{
         .track_id = "track",
         .state = .paused,
         .duration_ms = 300_000,
-    }, null));
+    }, null, "cover"));
 
     try std.testing.expect(last.needsUpdate(.{
         .track_id = "other",
         .state = .playing,
         .duration_ms = 300_000,
-    }, .{ .start = 10_000 }));
+    }, .{ .start = 10_000 }, "cover"));
+}
+
+test "LastPlayback.needsUpdate: republishes a changed image" {
+    const last: LastPlayback = .{ .track_id = @constCast("track"), .state = .paused, .image = "fallback" };
+    const playback: lyra.CurrentPlayback = .{ .track_id = "track", .state = .paused };
+
+    try std.testing.expect(!last.needsUpdate(playback, null, "fallback"));
+    try std.testing.expect(last.needsUpdate(playback, null, "cover"));
 }
 
 test "LastPlayback.set: copies the track id and tracks activity" {
@@ -778,10 +838,11 @@ test "LastPlayback.set: copies the track id and tracks activity" {
         .track_id = "track",
         .state = .playing,
         .duration_ms = 1000,
-    }, .{ .start = 5 });
+    }, .{ .start = 5 }, "image");
     try std.testing.expect(last.active());
     try std.testing.expectEqualStrings("track", last.track_id);
     try std.testing.expectEqual(5, last.activity_start_ms.?);
+    try std.testing.expectEqualStrings("image", last.image);
 
     last.clear(std.testing.allocator);
     try std.testing.expect(!last.active());
@@ -799,6 +860,21 @@ test "playbackTimestamps: playing derives start from position" {
     try std.testing.expectEqual(270_000, timestamps.end.?);
 
     try std.testing.expect(playbackTimestamps(.{ .state = .paused }, now) == null);
+}
+
+test "CoverRetry: backs off exponentially, then stops" {
+    var retry: CoverRetry = .{};
+    const now: Io.Timestamp = .{ .nanoseconds = 1000 * std.time.ns_per_ms };
+    try std.testing.expect(!retry.due(now));
+
+    for ([_]i64{ 30, 60, 120, 240, 480 }) |seconds| {
+        retry.recordFailure(now);
+        try std.testing.expect(!retry.due(now));
+        try std.testing.expectEqual(1000 + seconds * std.time.ms_per_s, retry.next_attempt_ms.?);
+    }
+
+    retry.recordFailure(now);
+    try std.testing.expectEqual(null, retry.next_attempt_ms);
 }
 
 test "ResponseWriter bounds chunked HTTP bodies across writes" {
@@ -849,7 +925,7 @@ fn testFailedPublication(alloc: Allocator) !void {
     var app = try App.init(alloc, std.testing.io, &environ, .{});
     defer app.deinit();
 
-    try app.last.set(alloc, .{ .track_id = "A", .state = .playing }, .{ .start = 1000 });
+    try app.last.set(alloc, .{ .track_id = "A", .state = .playing }, .{ .start = 1000 }, fallback_image);
     app.cached_track = try std.json.parseFromSlice(lyra.Track, alloc,
         \\{"id":"B","title":"Track B"}
     , lyra.json_parse_options);
@@ -875,6 +951,39 @@ fn testFailedPublication(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("Track B", app.cachedTrack("B").?.title);
 
     // Returning to A and pausing must fetch A, never render B under A's id.
-    try std.testing.expect(app.last.needsUpdate(.{ .track_id = "A", .state = .paused }, null));
+    try std.testing.expect(app.last.needsUpdate(.{ .track_id = "A", .state = .paused }, null, app.cached_image));
     try std.testing.expect(app.cachedTrack("A") == null);
+}
+
+test "due cover retry changes the image and stays pending until published" {
+    const alloc = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    var app = try App.init(alloc, std.testing.io, &environ, .{
+        .images = .{ .uploader = .imgur, .imgur_client_id = "id" },
+    });
+    defer app.deinit();
+
+    app.cached_track = try std.json.parseFromSlice(lyra.Track, alloc,
+        \\{"id":"T","title":"Track","releases":[{"id":"R"}]}
+    , lyra.json_parse_options);
+    app.cached_track_id = try alloc.dupe(u8, "T");
+    const key = try alloc.dupe(u8, "R");
+    const url = try alloc.dupe(u8, "https://example.test/cover");
+    try app.cover_cache.put(alloc, key, url);
+
+    const playback: lyra.CurrentPlayback = .{ .track_id = "T", .state = .paused };
+    try app.last.set(alloc, playback, null, fallback_image);
+    app.cover_retry = .{ .failures = 1, .next_attempt_ms = 1000 };
+
+    try app.updatePresence(playback, .{ .nanoseconds = 999 * std.time.ns_per_ms });
+    try std.testing.expectEqualStrings(fallback_image, app.cached_image);
+
+    try std.testing.expectError(
+        error.NotConnected,
+        app.updatePresence(playback, .{ .nanoseconds = 1000 * std.time.ns_per_ms }),
+    );
+    try std.testing.expectEqualStrings(url, app.cached_image);
+    try std.testing.expectEqual(null, app.cover_retry.next_attempt_ms);
+    try std.testing.expect(app.last.needsUpdate(playback, null, app.cached_image));
 }
