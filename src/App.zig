@@ -118,7 +118,8 @@ const LastPlayback = struct {
 
         if (timestamps) |value| {
             const last_start = self.activity_start_ms orelse return true;
-            if (absDiff(value.start, last_start) > seek_detection_threshold_ms) return true;
+            const drift_ms = @max(value.start, last_start) - @min(value.start, last_start);
+            if (drift_ms > seek_detection_threshold_ms) return true;
         }
 
         return false;
@@ -519,7 +520,7 @@ fn uploadToLitterbox(self: *App, image: []const u8) ![]u8 {
     defer resp.deinit(self.alloc);
 
     if (resp.status != .ok) return error.UnexpectedApiStatus;
-    return self.alloc.dupe(u8, lyra.trimSpace(resp.body));
+    return self.alloc.dupe(u8, std.mem.trim(u8, resp.body, &std.ascii.whitespace));
 }
 
 fn uploadToImgur(self: *App, image: []const u8) ![]u8 {
@@ -779,10 +780,6 @@ fn playbackTimestamps(
         .start = @intCast(@max(start_ms, 0)),
         .end = if (end_ms) |value| @intCast(@max(value, 0)) else null,
     };
-}
-
-fn absDiff(a: u64, b: u64) u64 {
-    return if (a > b) a - b else b - a;
 }
 
 fn logRequestError(self: *App, comptime label: []const u8, err: ApiError) void {

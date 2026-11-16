@@ -208,8 +208,11 @@ pub const ApiStatusError = struct {
     body: []const u8,
 
     pub fn format(self: ApiStatusError, writer: *Io.Writer) Io.Writer.Error!void {
-        var clean_body = trimSpace(self.body);
-        if (std.mem.cutPrefix(u8, clean_body, "Error:")) |rest| clean_body = trimSpace(rest);
+        const whitespace = &std.ascii.whitespace;
+        var clean_body = std.mem.trim(u8, self.body, whitespace);
+        if (std.mem.cutPrefix(u8, clean_body, "Error:")) |rest| {
+            clean_body = std.mem.trimStart(u8, rest, whitespace);
+        }
         const hint: []const u8 = switch (self.status.class()) {
             .server_error => "\nCheck the Lyra server logs for details.",
             else => switch (self.status) {
@@ -295,10 +298,6 @@ pub fn releaseLookupPath(
 
 fn writePathEscaped(writer: *Io.Writer, input: []const u8) Io.Writer.Error!void {
     try @as(std.Uri.Component, .{ .raw = input }).formatEscaped(writer);
-}
-
-pub fn trimSpace(input: []const u8) []const u8 {
-    return std.mem.trim(u8, input, " \t\r\n");
 }
 
 test "releaseYear" {

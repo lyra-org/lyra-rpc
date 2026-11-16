@@ -242,13 +242,13 @@ fn compactEmptyParenthesizedGroups(input: []u8) usize {
         assert(write_index <= index);
         if (input[index] == '(') {
             if (std.mem.findScalarPos(u8, input, index + 1, ')')) |end| {
-                if (lyra.trimSpace(input[index + 1 .. end]).len == 0) {
-                    while (write_index > 0 and isTemplateSpace(input[write_index - 1])) {
+                if (std.mem.trim(u8, input[index + 1 .. end], &std.ascii.whitespace).len == 0) {
+                    while (write_index > 0 and std.ascii.isWhitespace(input[write_index - 1])) {
                         write_index -= 1;
                     }
 
                     index = end + 1;
-                    while (index < input.len and isTemplateSpace(input[index])) {
+                    while (index < input.len and std.ascii.isWhitespace(input[index])) {
                         index += 1;
                     }
                     if (index < input.len and write_index > 0) {
@@ -266,12 +266,12 @@ fn compactEmptyParenthesizedGroups(input: []u8) usize {
     }
 
     var start: usize = 0;
-    while (start < write_index and isTemplateSpace(input[start])) {
+    while (start < write_index and std.ascii.isWhitespace(input[start])) {
         start += 1;
     }
 
     var end = write_index;
-    while (end > start and isTemplateSpace(input[end - 1])) {
+    while (end > start and std.ascii.isWhitespace(input[end - 1])) {
         end -= 1;
     }
 
@@ -280,10 +280,6 @@ fn compactEmptyParenthesizedGroups(input: []u8) usize {
         @memmove(input[0..new_len], input[start..end]);
     }
     return new_len;
-}
-
-fn isTemplateSpace(ch: u8) bool {
-    return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
 }
 
 test "render: default templates" {
