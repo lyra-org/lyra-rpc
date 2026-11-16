@@ -794,8 +794,9 @@ fn logRequestError(self: *App, comptime label: []const u8, err: ApiError) void {
 }
 
 test "LastPlayback.needsUpdate: skips normal playing progress" {
+    var track_id = "track".*;
     const last: LastPlayback = .{
-        .track_id = @constCast("track"),
+        .track_id = &track_id,
         .state = .playing,
         .duration_ms = 300_000,
         .activity_start_ms = 10_000,
@@ -834,7 +835,8 @@ test "LastPlayback.needsUpdate: skips normal playing progress" {
 }
 
 test "LastPlayback.needsUpdate: republishes a changed image" {
-    const last: LastPlayback = .{ .track_id = @constCast("track"), .state = .paused, .image = "fallback" };
+    var track_id = "track".*;
+    const last: LastPlayback = .{ .track_id = &track_id, .state = .paused, .image = "fallback" };
     const playback: lyra.CurrentPlayback = .{ .track_id = "track", .state = .paused };
 
     try std.testing.expect(!last.needsUpdate(playback, null, "fallback"));

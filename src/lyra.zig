@@ -333,13 +333,11 @@ test "displayArtistNames: falls back to all names" {
 }
 
 test "playbackLogLine: includes artists" {
-    const track: Track = .{
-        .title = "Song",
-        .artists = @constCast(&[_]Artist{
-            .{ .name = "Artist One", .credit = .{ .type = .artist } },
-            .{ .name = "Artist Two", .credit = .{ .type = .artist } },
-        }),
+    var artists = [_]Artist{
+        .{ .name = "Artist One", .credit = .{ .type = .artist } },
+        .{ .name = "Artist Two", .credit = .{ .type = .artist } },
     };
+    const track: Track = .{ .title = "Song", .artists = &artists };
     const paused = try playbackLogLine(std.testing.allocator, .paused, track);
     defer std.testing.allocator.free(paused);
     try std.testing.expectEqualStrings("Paused: Song - Artist One, Artist Two", paused);
