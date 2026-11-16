@@ -25,7 +25,16 @@ pub fn build(b: *std.Build) void {
 
     b.step("run", "Run the app").dependOn(&run_cmd.step);
 
-    const exe_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Only run tests whose name contains this text (repeatable)",
+    ) orelse &.{};
+
+    const exe_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = exe.root_module,
+        .filters = test_filters,
+    }));
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&exe_tests.step);

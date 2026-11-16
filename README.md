@@ -19,6 +19,13 @@ zig build -Doptimize=ReleaseSmall
 ./zig-out/bin/lyra_rpc
 ```
 
+Run the tests, optionally only those whose name contains some text:
+
+```sh
+zig build test
+zig build test -Dtest-filter=CoverRetry
+```
+
 Optionally create a `config.json` in the working directory:
 
 ```json

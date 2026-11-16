@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the version named by `minimum_zig_version` in build.zig.zon.
+      - uses: mlugg/setup-zig@v2
+      - name: Check formatting
+        run: zig fmt --check .
+      - name: Test
+        run: zig build test --summary all
+      - name: Cross-compile
+        run: |
+          zig build -Dtarget=x86_64-windows
+          zig build -Dtarget=aarch64-macos
