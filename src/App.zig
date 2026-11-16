@@ -20,6 +20,7 @@ const presence = @import("presence.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const assert = std.debug.assert;
 
 const log = std.log.scoped(.app);
 
@@ -158,6 +159,11 @@ const CoverRetry = struct {
     const max_retries = 5;
     const base_delay_ms: i64 = 30 * std.time.ms_per_s;
 
+    comptime {
+        // The longest delay must survive the shift in `recordFailure`.
+        assert(base_delay_ms <= std.math.maxInt(i64) >> max_retries);
+    }
+
     fn due(self: CoverRetry, now: Io.Timestamp) bool {
         const next_attempt_ms = self.next_attempt_ms orelse return false;
         return now.toMilliseconds() >= next_attempt_ms;
@@ -241,6 +247,7 @@ const ResponseWriter = struct {
 
     fn drain(writer: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const self: *ResponseWriter = @fieldParentPtr("writer", writer);
+        assert(self.body.written().len <= self.limit);
         var remaining = self.limit - self.body.written().len;
         for (data, 0..) |part, i| {
             const repetitions = if (i == data.len - 1) splat else 1;
@@ -270,10 +277,10 @@ pub fn init(
         &.{};
     errdefer alloc.free(auth_header);
 
-    const imgur_auth_header = if (config.images.uploader == .imgur)
-        try std.fmt.allocPrint(alloc, "Client-ID {s}", .{config.images.imgur_client_id})
-    else
-        &.{};
+    const imgur_auth_header = if (config.images.uploader == .imgur) header: {
+        assert(config.images.imgur_client_id.len > 0);
+        break :header try std.fmt.allocPrint(alloc, "Client-ID {s}", .{config.images.imgur_client_id});
+    } else &.{};
     errdefer alloc.free(imgur_auth_header);
 
     return .{
@@ -732,6 +739,7 @@ fn ensureReleaseDetails(
     if (self.release_details.get(includes)) |release| return release;
 
     const fetch_includes = self.release_details.includes.merge(includes);
+    assert(fetch_includes.contains(includes));
     const parsed = try self.fetchReleaseDetails(release_id, fetch_includes);
     self.release_details.clear();
     self.release_details = .{ .parsed = parsed, .includes = fetch_includes };

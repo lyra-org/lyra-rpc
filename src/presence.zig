@@ -17,6 +17,7 @@ const lyra = @import("lyra.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const assert = std.debug.assert;
 
 pub const TemplateError = error{InvalidPresenceTemplate};
 
@@ -237,6 +238,8 @@ fn compactEmptyParenthesizedGroups(input: []u8) usize {
     var index: usize = 0;
     var write_index: usize = 0;
     while (index < input.len) {
+        // Writes never overtake reads, so compacting in place is safe.
+        assert(write_index <= index);
         if (input[index] == '(') {
             if (std.mem.findScalarPos(u8, input, index + 1, ')')) |end| {
                 if (lyra.trimSpace(input[index + 1 .. end]).len == 0) {

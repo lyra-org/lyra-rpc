@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const assert = std.debug.assert;
 
 const log = std.log.scoped(.discord);
 
@@ -148,6 +149,11 @@ const IpcConn = union(enum) {
     const frame_header_len = 8;
     // Local resource limit, comfortably above READY and activity responses.
     const max_frame_len = 1024 * 1024;
+
+    comptime {
+        // Payload lengths are cast to the header's `u32`.
+        assert(max_frame_len <= std.math.maxInt(u32));
+    }
 
     const Frame = struct {
         opcode: Opcode,
@@ -290,6 +296,8 @@ const IpcConn = union(enum) {
     }
 
     fn writeFrameTo(writer: *Io.Writer, header: []const u8, payload: []const u8) Io.Writer.Error!void {
+        assert(header.len == frame_header_len);
+        assert(payload.len <= max_frame_len);
         try writer.writeAll(header);
         try writer.writeAll(payload);
         try writer.flush();
