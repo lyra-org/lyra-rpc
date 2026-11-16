@@ -418,7 +418,7 @@ fn fetchBounded(self: *App, options: std.http.Client.FetchOptions, limit: usize)
 }
 
 fn fetchActivePlayback(self: *App) ApiError!PlaybackResult {
-    var path = try lyra.activePlaybackPath(self.alloc, null);
+    var path = try lyra.activePlaybackPath(self.alloc, 0);
     defer self.alloc.free(path);
 
     while (true) {
@@ -436,11 +436,11 @@ fn fetchActivePlayback(self: *App) ApiError!PlaybackResult {
         if (parsed.value.firstCurrent()) |playback| {
             return .{ .active = .{ .parsed = parsed, .playback = playback } };
         }
-        const cursor = parsed.value.next_cursor orelse {
+        const next_offset = parsed.value.nextOffset() orelse {
             parsed.deinit();
             return .{ .active = .{} };
         };
-        const next_path = try lyra.activePlaybackPath(self.alloc, cursor);
+        const next_path = try lyra.activePlaybackPath(self.alloc, next_offset);
         parsed.deinit();
         self.alloc.free(path);
         path = next_path;

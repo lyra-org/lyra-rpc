@@ -21,9 +21,24 @@ pub const json_parse_options: std.json.ParseOptions = .{
 /// Errors from building a string in an allocating writer.
 pub const FormatError = Allocator.Error || Io.Writer.Error;
 
+/// Requested explicitly so paging does not depend on the server's default.
+pub const playback_page_limit = 100;
+
 pub const PlaybackPage = struct {
     items: []Playback,
-    next_cursor: ?[]const u8,
+
+    /// Size of the whole list, across pages.
+    total: u64,
+
+    /// Where `items` starts in the list; `total` when past the end.
+    offset: u64,
+
+    /// Null on the last page. Steps by the requested limit, not by
+    /// `items.len`, because the server may return a short page mid-list.
+    pub fn nextOffset(self: PlaybackPage) ?u64 {
+        const next = self.offset +| playback_page_limit;
+        return if (next < self.total) next else null;
+    }
 
     pub fn firstCurrent(self: PlaybackPage) ?CurrentPlayback {
         for (self.items) |playback| {
@@ -34,7 +49,7 @@ pub const PlaybackPage = struct {
 };
 
 pub const Playback = struct {
-    current: ?CurrentPlayback,
+    current: ?CurrentPlayback = null,
 };
 
 pub const CurrentPlayback = struct {
@@ -234,16 +249,12 @@ pub const ApiStatusError = struct {
     }
 };
 
-pub fn activePlaybackPath(alloc: Allocator, cursor: ?[]const u8) FormatError![]u8 {
-    var out: Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("/api/me/playbacks?active=true");
-    if (cursor) |value| {
-        try out.writer.writeAll("&cursor=");
-        try writePathEscaped(&out.writer, value);
-    }
-    return out.toOwnedSlice();
+pub fn activePlaybackPath(alloc: Allocator, offset: u64) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "/api/me/playbacks?active=true&limit={}&offset={}",
+        .{ playback_page_limit, offset },
+    );
 }
 
 pub fn trackLookupPath(alloc: Allocator, track_id: []const u8) FormatError![]u8 {
@@ -435,7 +446,7 @@ test "PlaybackPage: decodes native and reported current playback" {
             \\"track_id":"track","position_ms":1200,"effective_position_ms":1500,
             \\"duration_ms":3000,"state":"playing","activity_ms":3400,
             \\"updated_at":"2026-09-10T07:00:00Z","client_name":"Player"
-            \\}}}}],"next_cursor":null}}
+            \\}}}}],"total":1,"offset":0}}
         , .{revision});
         defer alloc.free(body);
         const page = try std.json.parseFromSlice(PlaybackPage, alloc, body, json_parse_options);
@@ -447,7 +458,7 @@ test "PlaybackPage: decodes native and reported current playback" {
         try testing.expectEqual(1200, current.position_ms);
         try testing.expectEqual(1500, current.effective_position_ms);
         try testing.expectEqual(3000, current.duration_ms.?);
-        try testing.expect(page.value.next_cursor == null);
+        try testing.expectEqual(null, page.value.nextOffset());
     }
 }
 
@@ -455,7 +466,7 @@ test "PlaybackPage: preserves order and skips null current playback" {
     const page = try std.json.parseFromSlice(PlaybackPage, testing.allocator,
         \\{"items":[{"current":null},
         \\{"current":{"track_id":"first","state":"paused","duration_ms":null}},
-        \\{"current":{"track_id":"second","state":"playing"}}],"next_cursor":"next"}
+        \\{"current":{"track_id":"second","state":"playing"}}],"total":3,"offset":0}
     , json_parse_options);
     defer page.deinit();
 
@@ -463,41 +474,65 @@ test "PlaybackPage: preserves order and skips null current playback" {
     try testing.expectEqualStrings("first", current.track_id);
     try testing.expectEqual(.paused, current.state);
     try testing.expect(current.duration_ms == null);
-    try testing.expectEqualStrings("next", page.value.next_cursor.?);
 }
 
-test "PlaybackPage: no current playback keeps the cursor" {
+test "PlaybackPage: no current playback" {
     for ([_][]const u8{
-        \\{"items":[],"next_cursor":null}
+        \\{"items":[],"total":0,"offset":0}
         ,
-        \\{"items":[{"current":null}],"next_cursor":"next"}
+        \\{"items":[{"current":null}],"total":1,"offset":0}
+        ,
+        \\{"items":[{"id":"hidden"}],"total":1,"offset":0}
         ,
     }) |body| {
-        const page = try std.json.parseFromSlice(PlaybackPage, testing.allocator, body, json_parse_options);
+        const page = try std.json.parseFromSlice(
+            PlaybackPage,
+            testing.allocator,
+            body,
+            json_parse_options,
+        );
         defer page.deinit();
-        try testing.expect(page.value.firstCurrent() == null);
-        if (page.value.items.len != 0) {
-            try testing.expectEqualStrings("next", page.value.next_cursor.?);
-        }
+        try testing.expectEqual(null, page.value.firstCurrent());
+        try testing.expectEqual(null, page.value.nextOffset());
     }
+}
+
+test "PlaybackPage.nextOffset: steps by the page limit until the list ends" {
+    const first: PlaybackPage = .{ .items = &.{}, .total = 250, .offset = 0 };
+    try testing.expectEqual(100, first.nextOffset().?);
+
+    // A short page mid-list still advances by a full page.
+    var items = [_]Playback{.{}};
+    const short: PlaybackPage = .{ .items = &items, .total = 250, .offset = 100 };
+    try testing.expectEqual(200, short.nextOffset().?);
+
+    const last: PlaybackPage = .{ .items = &.{}, .total = 250, .offset = 200 };
+    try testing.expectEqual(null, last.nextOffset());
+
+    // Past the end the server reports `offset == total`.
+    const past: PlaybackPage = .{ .items = &.{}, .total = 250, .offset = 250 };
+    try testing.expectEqual(null, past.nextOffset());
+
+    const exact: PlaybackPage = .{ .items = &.{}, .total = 100, .offset = 0 };
+    try testing.expectEqual(null, exact.nextOffset());
 }
 
 test "PlaybackState: unknown states decode instead of failing" {
     const page = try std.json.parseFromSlice(PlaybackPage, testing.allocator,
-        \\{"items":[{"current":{"track_id":"t","state":"buffering"}}],"next_cursor":null}
+        \\{"items":[{"current":{"track_id":"t","state":"buffering"}}],"total":1,"offset":0}
     , json_parse_options);
     defer page.deinit();
     try testing.expectEqual(.unknown, page.value.firstCurrent().?.state);
 }
 
-test "activePlaybackPath: preserves the filter and escapes cursors" {
+test "activePlaybackPath: keeps the filter and pages by offset" {
     const alloc = testing.allocator;
-    const first = try activePlaybackPath(alloc, null);
+    const first = try activePlaybackPath(alloc, 0);
     defer alloc.free(first);
-    try testing.expectEqualStrings("/api/me/playbacks?active=true", first);
-    const next = try activePlaybackPath(alloc, "a+/=&?");
+    try testing.expectEqualStrings("/api/me/playbacks?active=true&limit=100&offset=0", first);
+    const next = try activePlaybackPath(alloc, 100);
     defer alloc.free(next);
-    try testing.expectEqualStrings("/api/me/playbacks?active=true&cursor=a%2B%2F%3D%26%3F", next);
+    try testing.expectEqualStrings("/api/me/playbacks?active=true&limit=100&offset=100", next);
 }
 
 test "Track: decodes nullable includes" {
