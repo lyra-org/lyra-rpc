@@ -21,6 +21,7 @@ const presence = @import("presence.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const assert = std.debug.assert;
+const testing = std.testing;
 
 const log = std.log.scoped(.app);
 
@@ -803,31 +804,31 @@ test "LastPlayback.needsUpdate: skips normal playing progress" {
         .image = "cover",
     };
 
-    try std.testing.expect(!last.needsUpdate(.{
+    try testing.expect(!last.needsUpdate(.{
         .track_id = "track",
         .state = .playing,
         .duration_ms = 300_000,
     }, .{ .start = 11_500 }, "cover"));
 
-    try std.testing.expect(last.needsUpdate(.{
+    try testing.expect(last.needsUpdate(.{
         .track_id = "track",
         .state = .playing,
         .duration_ms = 300_000,
     }, .{ .start = 12_001 }, "cover"));
 
-    try std.testing.expect(last.needsUpdate(.{
+    try testing.expect(last.needsUpdate(.{
         .track_id = "track",
         .state = .playing,
         .duration_ms = 301_000,
     }, .{ .start = 10_000 }, "cover"));
 
-    try std.testing.expect(last.needsUpdate(.{
+    try testing.expect(last.needsUpdate(.{
         .track_id = "track",
         .state = .paused,
         .duration_ms = 300_000,
     }, null, "cover"));
 
-    try std.testing.expect(last.needsUpdate(.{
+    try testing.expect(last.needsUpdate(.{
         .track_id = "other",
         .state = .playing,
         .duration_ms = 300_000,
@@ -839,28 +840,29 @@ test "LastPlayback.needsUpdate: republishes a changed image" {
     const last: LastPlayback = .{ .track_id = &track_id, .state = .paused, .image = "fallback" };
     const playback: lyra.CurrentPlayback = .{ .track_id = "track", .state = .paused };
 
-    try std.testing.expect(!last.needsUpdate(playback, null, "fallback"));
-    try std.testing.expect(last.needsUpdate(playback, null, "cover"));
+    try testing.expect(!last.needsUpdate(playback, null, "fallback"));
+    try testing.expect(last.needsUpdate(playback, null, "cover"));
 }
 
 test "LastPlayback.set: copies the track id and tracks activity" {
+    const alloc = testing.allocator;
     var last: LastPlayback = .{};
-    defer last.deinit(std.testing.allocator);
-    try std.testing.expect(!last.active());
+    defer last.deinit(alloc);
+    try testing.expect(!last.active());
 
-    try last.set(std.testing.allocator, .{
+    try last.set(alloc, .{
         .track_id = "track",
         .state = .playing,
         .duration_ms = 1000,
     }, .{ .start = 5 }, "image");
-    try std.testing.expect(last.active());
-    try std.testing.expectEqualStrings("track", last.track_id);
-    try std.testing.expectEqual(5, last.activity_start_ms.?);
-    try std.testing.expectEqualStrings("image", last.image);
+    try testing.expect(last.active());
+    try testing.expectEqualStrings("track", last.track_id);
+    try testing.expectEqual(5, last.activity_start_ms.?);
+    try testing.expectEqualStrings("image", last.image);
 
-    last.clear(std.testing.allocator);
-    try std.testing.expect(!last.active());
-    try std.testing.expectEqual(0, last.track_id.len);
+    last.clear(alloc);
+    try testing.expect(!last.active());
+    try testing.expectEqual(0, last.track_id.len);
 }
 
 test "playbackTimestamps: playing derives start from position" {
@@ -870,25 +872,25 @@ test "playbackTimestamps: playing derives start from position" {
         .position_ms = 30_000,
         .duration_ms = 200_000,
     }, now).?;
-    try std.testing.expectEqual(70_000, timestamps.start);
-    try std.testing.expectEqual(270_000, timestamps.end.?);
+    try testing.expectEqual(70_000, timestamps.start);
+    try testing.expectEqual(270_000, timestamps.end.?);
 
-    try std.testing.expect(playbackTimestamps(.{ .state = .paused }, now) == null);
+    try testing.expect(playbackTimestamps(.{ .state = .paused }, now) == null);
 }
 
 test "CoverRetry: backs off exponentially, then stops" {
     var retry: CoverRetry = .{};
     const now: Io.Timestamp = .{ .nanoseconds = 1000 * std.time.ns_per_ms };
-    try std.testing.expect(!retry.due(now));
+    try testing.expect(!retry.due(now));
 
     for ([_]i64{ 30, 60, 120, 240, 480 }) |seconds| {
         retry.recordFailure(now);
-        try std.testing.expect(!retry.due(now));
-        try std.testing.expectEqual(1000 + seconds * std.time.ms_per_s, retry.next_attempt_ms.?);
+        try testing.expect(!retry.due(now));
+        try testing.expectEqual(1000 + seconds * std.time.ms_per_s, retry.next_attempt_ms.?);
     }
 
     retry.recordFailure(now);
-    try std.testing.expectEqual(null, retry.next_attempt_ms);
+    try testing.expectEqual(null, retry.next_attempt_ms);
 }
 
 test "ResponseWriter bounds chunked HTTP bodies across writes" {
@@ -906,37 +908,37 @@ test "ResponseWriter bounds chunked HTTP bodies across writes" {
         _ = try http_reader.receiveHead();
         var transfer_buffer: [3]u8 = undefined;
         const body = http_reader.bodyReader(&transfer_buffer, .chunked, null);
-        var output: ResponseWriter = .{ .body = .init(std.testing.allocator), .limit = limit };
+        var output: ResponseWriter = .{ .body = .init(testing.allocator), .limit = limit };
         defer output.body.deinit();
         if (limit == 8) {
-            try std.testing.expectEqual(8, try body.streamRemaining(&output.writer));
-            try std.testing.expectEqualStrings("abcdefgh", output.body.written());
-            try std.testing.expect(!output.too_large);
+            try testing.expectEqual(8, try body.streamRemaining(&output.writer));
+            try testing.expectEqualStrings("abcdefgh", output.body.written());
+            try testing.expect(!output.too_large);
         } else {
-            try std.testing.expectError(error.WriteFailed, body.streamRemaining(&output.writer));
-            try std.testing.expect(output.too_large);
-            try std.testing.expect(output.body.written().len <= limit);
+            try testing.expectError(error.WriteFailed, body.streamRemaining(&output.writer));
+            try testing.expect(output.too_large);
+            try testing.expect(output.body.written().len <= limit);
         }
     }
 }
 
 test "ResponseWriter bounds repeated writes without allocating excess data" {
-    var output: ResponseWriter = .{ .body = .init(std.testing.allocator), .limit = 8 };
+    var output: ResponseWriter = .{ .body = .init(testing.allocator), .limit = 8 };
     defer output.body.deinit();
     try output.writer.writeAll("abcd");
-    try std.testing.expectError(error.WriteFailed, output.writer.splatByteAll('x', 5));
-    try std.testing.expect(output.too_large);
-    try std.testing.expectEqualStrings("abcd", output.body.written());
+    try testing.expectError(error.WriteFailed, output.writer.splatByteAll('x', 5));
+    try testing.expect(output.too_large);
+    try testing.expectEqualStrings("abcd", output.body.written());
 }
 
 test "failed publication preserves last playback and keeps cache identity separate" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testFailedPublication, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, testFailedPublication, .{});
 }
 
 fn testFailedPublication(alloc: Allocator) !void {
     var environ = std.process.Environ.Map.init(alloc);
     defer environ.deinit();
-    var app = try App.init(alloc, std.testing.io, &environ, .{});
+    var app = try App.init(alloc, testing.io, &environ, .{});
     defer app.deinit();
 
     try app.last.set(alloc, .{ .track_id = "A", .state = .playing }, .{ .start = 1000 }, fallback_image);
@@ -954,26 +956,26 @@ fn testFailedPublication(alloc: Allocator) !void {
     if (publication) |_| {
         return error.TestExpectedError;
     } else |err| {
-        try std.testing.expectEqualStrings("A", app.last.track_id);
-        try std.testing.expectEqual(.playing, app.last.state.?);
+        try testing.expectEqualStrings("A", app.last.track_id);
+        try testing.expectEqual(.playing, app.last.state.?);
         if (err == error.OutOfMemory or err == error.WriteFailed) return error.OutOfMemory;
-        try std.testing.expectEqual(error.NotConnected, err);
+        try testing.expectEqual(error.NotConnected, err);
     }
-    try std.testing.expectEqualStrings("A", app.last.track_id);
-    try std.testing.expectEqual(.playing, app.last.state.?);
-    try std.testing.expectEqual(1000, app.last.activity_start_ms.?);
-    try std.testing.expectEqualStrings("Track B", app.cachedTrack("B").?.title);
+    try testing.expectEqualStrings("A", app.last.track_id);
+    try testing.expectEqual(.playing, app.last.state.?);
+    try testing.expectEqual(1000, app.last.activity_start_ms.?);
+    try testing.expectEqualStrings("Track B", app.cachedTrack("B").?.title);
 
     // Returning to A and pausing must fetch A, never render B under A's id.
-    try std.testing.expect(app.last.needsUpdate(.{ .track_id = "A", .state = .paused }, null, app.cached_image));
-    try std.testing.expect(app.cachedTrack("A") == null);
+    try testing.expect(app.last.needsUpdate(.{ .track_id = "A", .state = .paused }, null, app.cached_image));
+    try testing.expect(app.cachedTrack("A") == null);
 }
 
 test "due cover retry changes the image and stays pending until published" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var environ = std.process.Environ.Map.init(alloc);
     defer environ.deinit();
-    var app = try App.init(alloc, std.testing.io, &environ, .{
+    var app = try App.init(alloc, testing.io, &environ, .{
         .images = .{ .uploader = .imgur, .imgur_client_id = "id" },
     });
     defer app.deinit();
@@ -991,13 +993,13 @@ test "due cover retry changes the image and stays pending until published" {
     app.cover_retry = .{ .failures = 1, .next_attempt_ms = 1000 };
 
     try app.updatePresence(playback, .{ .nanoseconds = 999 * std.time.ns_per_ms });
-    try std.testing.expectEqualStrings(fallback_image, app.cached_image);
+    try testing.expectEqualStrings(fallback_image, app.cached_image);
 
-    try std.testing.expectError(
+    try testing.expectError(
         error.NotConnected,
         app.updatePresence(playback, .{ .nanoseconds = 1000 * std.time.ns_per_ms }),
     );
-    try std.testing.expectEqualStrings(url, app.cached_image);
-    try std.testing.expectEqual(null, app.cover_retry.next_attempt_ms);
-    try std.testing.expect(app.last.needsUpdate(playback, null, app.cached_image));
+    try testing.expectEqualStrings(url, app.cached_image);
+    try testing.expectEqual(null, app.cover_retry.next_attempt_ms);
+    try testing.expect(app.last.needsUpdate(playback, null, app.cached_image));
 }

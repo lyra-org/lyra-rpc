@@ -13,6 +13,7 @@ const presencepkg = @import("presence.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const testing = std.testing;
 
 const max_config_bytes = 1024 * 1024;
 
@@ -92,20 +93,20 @@ pub fn validate(self: Config) ValidateError!void {
 }
 
 test "partial presence config keeps the other defaults" {
-    var parsed = try std.json.parseFromSlice(Config, std.testing.allocator,
+    var parsed = try std.json.parseFromSlice(Config, testing.allocator,
         \\{"presence":{"image_text":"Lyra"}}
     , .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("{track.title}", parsed.value.presence.title);
-    try std.testing.expectEqualStrings("{release.title} ({release.year})", parsed.value.presence.subtitle);
-    try std.testing.expectEqualStrings("Lyra", parsed.value.presence.image_text);
-    try std.testing.expectEqualStrings(", ", parsed.value.presence.list_separator);
+    try testing.expectEqualStrings("{track.title}", parsed.value.presence.title);
+    try testing.expectEqualStrings("{release.title} ({release.year})", parsed.value.presence.subtitle);
+    try testing.expectEqualStrings("Lyra", parsed.value.presence.image_text);
+    try testing.expectEqualStrings(", ", parsed.value.presence.list_separator);
 }
 
 test "validate requires an imgur client id" {
     const config: Config = .{ .images = .{ .uploader = .imgur } };
-    try std.testing.expectError(error.MissingImgurClientId, config.validate());
+    try testing.expectError(error.MissingImgurClientId, config.validate());
 
     const ok: Config = .{ .images = .{ .uploader = .imgur, .imgur_client_id = "id" } };
     try ok.validate();
@@ -113,5 +114,5 @@ test "validate requires an imgur client id" {
 
 test "validate rejects unknown placeholders" {
     const config: Config = .{ .presence = .{ .title = "{bad.placeholder}" } };
-    try std.testing.expectError(error.InvalidPresenceTemplate, config.validate());
+    try testing.expectError(error.InvalidPresenceTemplate, config.validate());
 }

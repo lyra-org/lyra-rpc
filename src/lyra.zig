@@ -10,6 +10,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const testing = std.testing;
 
 /// Copies strings so parsed values never borrow the response body.
 pub const json_parse_options: std.json.ParseOptions = .{
@@ -301,56 +302,60 @@ fn writePathEscaped(writer: *Io.Writer, input: []const u8) Io.Writer.Error!void 
 }
 
 test "releaseYear" {
-    try std.testing.expectEqualStrings("2024", releaseYear(.{ .release_date = "2024-05-01" }));
-    try std.testing.expectEqualStrings("", releaseYear(.{ .release_date = "abcd-05-01" }));
-    try std.testing.expectEqualStrings("", releaseYear(.{ .release_date = "20" }));
-    try std.testing.expectEqualStrings("", releaseYear(.{}));
+    try testing.expectEqualStrings("2024", releaseYear(.{ .release_date = "2024-05-01" }));
+    try testing.expectEqualStrings("", releaseYear(.{ .release_date = "abcd-05-01" }));
+    try testing.expectEqualStrings("", releaseYear(.{ .release_date = "20" }));
+    try testing.expectEqualStrings("", releaseYear(.{}));
 }
 
 test "displayArtistNames: prefers primary credits" {
+    const alloc = testing.allocator;
     const artists = [_]Artist{
         .{ .name = "Primary One", .credit = .{ .type = .artist } },
         .{ .name = "Featured", .credit = .{ .type = .unknown } },
         .{ .name = "Primary One", .credit = .{ .type = .artist } },
     };
-    const names = try displayArtistNames(std.testing.allocator, &artists);
-    defer std.testing.allocator.free(names);
-    try std.testing.expectEqual(1, names.len);
-    try std.testing.expectEqualStrings("Primary One", names[0]);
+    const names = try displayArtistNames(alloc, &artists);
+    defer alloc.free(names);
+    try testing.expectEqual(1, names.len);
+    try testing.expectEqualStrings("Primary One", names[0]);
 }
 
 test "displayArtistNames: falls back to all names" {
+    const alloc = testing.allocator;
     const artists = [_]Artist{
         .{ .name = "First" },
         .{ .name = "Second" },
         .{ .name = "First" },
     };
-    const names = try displayArtistNames(std.testing.allocator, &artists);
-    defer std.testing.allocator.free(names);
-    try std.testing.expectEqual(2, names.len);
-    try std.testing.expectEqualStrings("First", names[0]);
-    try std.testing.expectEqualStrings("Second", names[1]);
+    const names = try displayArtistNames(alloc, &artists);
+    defer alloc.free(names);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("First", names[0]);
+    try testing.expectEqualStrings("Second", names[1]);
 }
 
 test "playbackLogLine: includes artists" {
+    const alloc = testing.allocator;
     var artists = [_]Artist{
         .{ .name = "Artist One", .credit = .{ .type = .artist } },
         .{ .name = "Artist Two", .credit = .{ .type = .artist } },
     };
     const track: Track = .{ .title = "Song", .artists = &artists };
-    const paused = try playbackLogLine(std.testing.allocator, .paused, track);
-    defer std.testing.allocator.free(paused);
-    try std.testing.expectEqualStrings("Paused: Song - Artist One, Artist Two", paused);
+    const paused = try playbackLogLine(alloc, .paused, track);
+    defer alloc.free(paused);
+    try testing.expectEqualStrings("Paused: Song - Artist One, Artist Two", paused);
 }
 
 test "playbackLogLine: omits empty artist suffix" {
-    const line = try playbackLogLine(std.testing.allocator, .playing, .{ .title = "Song" });
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("Playing: Song", line);
+    const alloc = testing.allocator;
+    const line = try playbackLogLine(alloc, .playing, .{ .title = "Song" });
+    defer alloc.free(line);
+    try testing.expectEqualStrings("Playing: Song", line);
 }
 
 test "ApiStatusError: format" {
-    try std.testing.expectFmt(
+    try testing.expectFmt(
         "tracks API: HTTP 400: Failed to deserialize query string: duplicate field `inc`",
         "{f}",
         .{ApiStatusError{
@@ -359,12 +364,12 @@ test "ApiStatusError: format" {
             .body = "Failed to deserialize query string: duplicate field `inc`\n",
         }},
     );
-    try std.testing.expectFmt(
+    try testing.expectFmt(
         "tracks API: HTTP 500\nCheck the Lyra server logs for details.",
         "{f}",
         .{ApiStatusError{ .label = "tracks API", .status = .internal_server_error, .body = "" }},
     );
-    try std.testing.expectFmt(
+    try testing.expectFmt(
         "Error fetching playback: HTTP 500: internal server error\nCheck the Lyra server logs for details.",
         "{f}",
         .{ApiStatusError{
@@ -373,7 +378,7 @@ test "ApiStatusError: format" {
             .body = "Error: internal server error\n",
         }},
     );
-    try std.testing.expectFmt(
+    try testing.expectFmt(
         "Error fetching playback: HTTP 401: missing bearer credential\nSet auth_token in config.json to a valid Lyra bearer token, then restart lyra-rpc.",
         "{f}",
         .{ApiStatusError{
@@ -385,41 +390,43 @@ test "ApiStatusError: format" {
 }
 
 test "lookup paths: escape ids and list includes" {
-    const track_path = try trackLookupPath(std.testing.allocator, "track/id");
-    defer std.testing.allocator.free(track_path);
-    try std.testing.expectEqualStrings("/api/tracks/track%2Fid?inc=releases%2Cartists", track_path);
+    const alloc = testing.allocator;
+    const track_path = try trackLookupPath(alloc, "track/id");
+    defer alloc.free(track_path);
+    try testing.expectEqualStrings("/api/tracks/track%2Fid?inc=releases%2Cartists", track_path);
 
-    const cover_path = try releaseLookupPath(std.testing.allocator, "release/id", .{ .covers = true });
-    defer std.testing.allocator.free(cover_path);
-    try std.testing.expectEqualStrings("/api/releases/release%2Fid?inc=covers", cover_path);
+    const cover_path = try releaseLookupPath(alloc, "release/id", .{ .covers = true });
+    defer alloc.free(cover_path);
+    try testing.expectEqualStrings("/api/releases/release%2Fid?inc=covers", cover_path);
 
-    const artists_path = try releaseLookupPath(std.testing.allocator, "release/id", .{ .artists = true });
-    defer std.testing.allocator.free(artists_path);
-    try std.testing.expectEqualStrings("/api/releases/release%2Fid?inc=artists", artists_path);
+    const artists_path = try releaseLookupPath(alloc, "release/id", .{ .artists = true });
+    defer alloc.free(artists_path);
+    try testing.expectEqualStrings("/api/releases/release%2Fid?inc=artists", artists_path);
 
-    const full_path = try releaseLookupPath(std.testing.allocator, "release/id", .{
+    const full_path = try releaseLookupPath(alloc, "release/id", .{
         .artists = true,
         .covers = true,
         .genres = true,
     });
-    defer std.testing.allocator.free(full_path);
-    try std.testing.expectEqualStrings("/api/releases/release%2Fid?inc=artists%2Ccovers%2Cgenres", full_path);
+    defer alloc.free(full_path);
+    try testing.expectEqualStrings("/api/releases/release%2Fid?inc=artists%2Ccovers%2Cgenres", full_path);
 }
 
 test "ReleaseLookupIncludes: set operations" {
     const covers: ReleaseLookupIncludes = .{ .covers = true };
-    try std.testing.expect(!ReleaseLookupIncludes.any(.{}));
-    try std.testing.expect(covers.any());
-    try std.testing.expect(covers.contains(.{}));
-    try std.testing.expect(covers.contains(.{ .covers = true }));
-    try std.testing.expect(!covers.contains(.{ .genres = true }));
+    try testing.expect(!ReleaseLookupIncludes.any(.{}));
+    try testing.expect(covers.any());
+    try testing.expect(covers.contains(.{}));
+    try testing.expect(covers.contains(.{ .covers = true }));
+    try testing.expect(!covers.contains(.{ .genres = true }));
     const merged = covers.merge(.{ .genres = true });
-    try std.testing.expect(merged.covers and merged.genres and !merged.artists);
+    try testing.expect(merged.covers and merged.genres and !merged.artists);
 }
 
 test "PlaybackPage: decodes native and reported current playback" {
+    const alloc = testing.allocator;
     for ([_][]const u8{ "1", "null" }) |revision| {
-        const body = try std.fmt.allocPrint(std.testing.allocator,
+        const body = try std.fmt.allocPrint(alloc,
             \\{{"items":[{{"id":"context","user_id":"user","queue_revision":{s},
             \\"updated_at":"2026-09-10T07:00:00Z","current":{{
             \\"track_id":"track","position_ms":1200,"effective_position_ms":1500,
@@ -427,22 +434,22 @@ test "PlaybackPage: decodes native and reported current playback" {
             \\"updated_at":"2026-09-10T07:00:00Z","client_name":"Player"
             \\}}}}],"next_cursor":null}}
         , .{revision});
-        defer std.testing.allocator.free(body);
-        const page = try std.json.parseFromSlice(PlaybackPage, std.testing.allocator, body, json_parse_options);
+        defer alloc.free(body);
+        const page = try std.json.parseFromSlice(PlaybackPage, alloc, body, json_parse_options);
         defer page.deinit();
 
         const current = page.value.firstCurrent().?;
-        try std.testing.expectEqualStrings("track", current.track_id);
-        try std.testing.expectEqual(.playing, current.state);
-        try std.testing.expectEqual(1200, current.position_ms);
-        try std.testing.expectEqual(1500, current.effective_position_ms);
-        try std.testing.expectEqual(3000, current.duration_ms.?);
-        try std.testing.expect(page.value.next_cursor == null);
+        try testing.expectEqualStrings("track", current.track_id);
+        try testing.expectEqual(.playing, current.state);
+        try testing.expectEqual(1200, current.position_ms);
+        try testing.expectEqual(1500, current.effective_position_ms);
+        try testing.expectEqual(3000, current.duration_ms.?);
+        try testing.expect(page.value.next_cursor == null);
     }
 }
 
 test "PlaybackPage: preserves order and skips null current playback" {
-    const page = try std.json.parseFromSlice(PlaybackPage, std.testing.allocator,
+    const page = try std.json.parseFromSlice(PlaybackPage, testing.allocator,
         \\{"items":[{"current":null},
         \\{"current":{"track_id":"first","state":"paused","duration_ms":null}},
         \\{"current":{"track_id":"second","state":"playing"}}],"next_cursor":"next"}
@@ -450,10 +457,10 @@ test "PlaybackPage: preserves order and skips null current playback" {
     defer page.deinit();
 
     const current = page.value.firstCurrent().?;
-    try std.testing.expectEqualStrings("first", current.track_id);
-    try std.testing.expectEqual(.paused, current.state);
-    try std.testing.expect(current.duration_ms == null);
-    try std.testing.expectEqualStrings("next", page.value.next_cursor.?);
+    try testing.expectEqualStrings("first", current.track_id);
+    try testing.expectEqual(.paused, current.state);
+    try testing.expect(current.duration_ms == null);
+    try testing.expectEqualStrings("next", page.value.next_cursor.?);
 }
 
 test "PlaybackPage: no current playback keeps the cursor" {
@@ -463,34 +470,35 @@ test "PlaybackPage: no current playback keeps the cursor" {
         \\{"items":[{"current":null}],"next_cursor":"next"}
         ,
     }) |body| {
-        const page = try std.json.parseFromSlice(PlaybackPage, std.testing.allocator, body, json_parse_options);
+        const page = try std.json.parseFromSlice(PlaybackPage, testing.allocator, body, json_parse_options);
         defer page.deinit();
-        try std.testing.expect(page.value.firstCurrent() == null);
+        try testing.expect(page.value.firstCurrent() == null);
         if (page.value.items.len != 0) {
-            try std.testing.expectEqualStrings("next", page.value.next_cursor.?);
+            try testing.expectEqualStrings("next", page.value.next_cursor.?);
         }
     }
 }
 
 test "PlaybackState: unknown states decode instead of failing" {
-    const page = try std.json.parseFromSlice(PlaybackPage, std.testing.allocator,
+    const page = try std.json.parseFromSlice(PlaybackPage, testing.allocator,
         \\{"items":[{"current":{"track_id":"t","state":"buffering"}}],"next_cursor":null}
     , json_parse_options);
     defer page.deinit();
-    try std.testing.expectEqual(.unknown, page.value.firstCurrent().?.state);
+    try testing.expectEqual(.unknown, page.value.firstCurrent().?.state);
 }
 
 test "activePlaybackPath: preserves the filter and escapes cursors" {
-    const first = try activePlaybackPath(std.testing.allocator, null);
-    defer std.testing.allocator.free(first);
-    try std.testing.expectEqualStrings("/api/me/playbacks?active=true", first);
-    const next = try activePlaybackPath(std.testing.allocator, "a+/=&?");
-    defer std.testing.allocator.free(next);
-    try std.testing.expectEqualStrings("/api/me/playbacks?active=true&cursor=a%2B%2F%3D%26%3F", next);
+    const alloc = testing.allocator;
+    const first = try activePlaybackPath(alloc, null);
+    defer alloc.free(first);
+    try testing.expectEqualStrings("/api/me/playbacks?active=true", first);
+    const next = try activePlaybackPath(alloc, "a+/=&?");
+    defer alloc.free(next);
+    try testing.expectEqualStrings("/api/me/playbacks?active=true&cursor=a%2B%2F%3D%26%3F", next);
 }
 
 test "Track: decodes nullable includes" {
-    var track = try std.json.parseFromSlice(Track, std.testing.allocator,
+    var track = try std.json.parseFromSlice(Track, testing.allocator,
         \\{
         \\  "id": "track",
         \\  "title": "Song",
@@ -504,17 +512,17 @@ test "Track: decodes nullable includes" {
     , json_parse_options);
     defer track.deinit();
 
-    try std.testing.expectEqualStrings("Song", track.value.title);
-    try std.testing.expectEqual(2, track.value.disc.?);
-    try std.testing.expectEqual(7, track.value.track.?);
-    try std.testing.expectEqual(2024, track.value.year.?);
-    try std.testing.expectEqual(222000, track.value.duration_ms.?);
-    try std.testing.expectEqual(0, trackArtists(track.value).len);
-    try std.testing.expectEqual(0, trackReleases(track.value).len);
+    try testing.expectEqualStrings("Song", track.value.title);
+    try testing.expectEqual(2, track.value.disc.?);
+    try testing.expectEqual(7, track.value.track.?);
+    try testing.expectEqual(2024, track.value.year.?);
+    try testing.expectEqual(222000, track.value.duration_ms.?);
+    try testing.expectEqual(0, trackArtists(track.value).len);
+    try testing.expectEqual(0, trackReleases(track.value).len);
 }
 
 test "Release: decodes the documented cover response" {
-    var release = try std.json.parseFromSlice(Release, std.testing.allocator,
+    var release = try std.json.parseFromSlice(Release, testing.allocator,
         \\{
         \\  "id": "rel",
         \\  "title": "Album",
@@ -539,27 +547,28 @@ test "Release: decodes the documented cover response" {
     , json_parse_options);
     defer release.deinit();
     const cover = release.value.cover orelse return error.TestExpectedCover;
-    try std.testing.expectEqualStrings("/api/covers/cov?v=hash", cover.url);
+    try testing.expectEqualStrings("/api/covers/cov?v=hash", cover.url);
     const artists = releaseArtists(release.value);
-    try std.testing.expectEqual(1, artists.len);
-    try std.testing.expectEqualStrings("Release Artist", artists[0].name);
-    try std.testing.expectEqual(.artist, artists[0].credit.?.type);
+    try testing.expectEqual(1, artists.len);
+    try testing.expectEqualStrings("Release Artist", artists[0].name);
+    try testing.expectEqual(.artist, artists[0].credit.?.type);
     const genres = releaseGenres(release.value);
-    try std.testing.expectEqual(2, genres.len);
-    try std.testing.expectEqualStrings("Rock", genres[0]);
-    try std.testing.expectEqualStrings("Pop", genres[1]);
+    try testing.expectEqual(2, genres.len);
+    try testing.expectEqualStrings("Rock", genres[0]);
+    try testing.expectEqualStrings("Pop", genres[1]);
 }
 
 test "json strings do not borrow the response body" {
-    const body = try std.testing.allocator.dupe(u8,
+    const alloc = testing.allocator;
+    const body = try alloc.dupe(u8,
         \\{"id":"track","title":"Song","artists":[{"name":"Artist","credit":{"type":"artist"}}],"releases":[]}
     );
-    var parsed = try std.json.parseFromSlice(Track, std.testing.allocator, body, json_parse_options);
-    std.testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(Track, alloc, body, json_parse_options);
+    alloc.free(body);
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("Song", parsed.value.title);
+    try testing.expectEqualStrings("Song", parsed.value.title);
     const artists = trackArtists(parsed.value);
-    try std.testing.expectEqual(1, artists.len);
-    try std.testing.expectEqualStrings("Artist", artists[0].name);
+    try testing.expectEqual(1, artists.len);
+    try testing.expectEqualStrings("Artist", artists[0].name);
 }

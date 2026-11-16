@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const assert = std.debug.assert;
+const testing = std.testing;
 
 const log = std.log.scoped(.discord);
 
@@ -520,36 +521,39 @@ fn newNonce(io: Io) [36]u8 {
 }
 
 test "newNonce: uuid v4 shape" {
-    const nonce = newNonce(std.testing.io);
+    const nonce = newNonce(testing.io);
 
-    try std.testing.expectEqual(36, nonce.len);
-    try std.testing.expectEqual('-', nonce[8]);
-    try std.testing.expectEqual('-', nonce[13]);
-    try std.testing.expectEqual('-', nonce[18]);
-    try std.testing.expectEqual('-', nonce[23]);
-    try std.testing.expectEqual('4', nonce[14]);
-    try std.testing.expect(std.mem.indexOfScalar(u8, "89ab", nonce[19]) != null);
+    try testing.expectEqual(36, nonce.len);
+    try testing.expectEqual('-', nonce[8]);
+    try testing.expectEqual('-', nonce[13]);
+    try testing.expectEqual('-', nonce[18]);
+    try testing.expectEqual('-', nonce[23]);
+    try testing.expectEqual('4', nonce[14]);
+    try testing.expect(std.mem.indexOfScalar(u8, "89ab", nonce[19]) != null);
 }
 
 test "handshakeJson" {
-    const frame = try handshakeJson(std.testing.allocator, "123");
-    defer std.testing.allocator.free(frame);
-    try std.testing.expectEqualStrings("{\"v\":1,\"client_id\":\"123\"}", frame);
+    const alloc = testing.allocator;
+    const frame = try handshakeJson(alloc, "123");
+    defer alloc.free(frame);
+    try testing.expectEqualStrings("{\"v\":1,\"client_id\":\"123\"}", frame);
 }
 
 test "clearActivityFrameJson: encodes null activity" {
-    const frame = try clearActivityFrameJson(std.testing.allocator, "nonce");
-    defer std.testing.allocator.free(frame);
-    const normalized = try normalizePidForTest(std.testing.allocator, frame);
-    defer std.testing.allocator.free(normalized);
-    try std.testing.expectEqualStrings(
+    const alloc = testing.allocator;
+    const frame = try clearActivityFrameJson(alloc, "nonce");
+    defer alloc.free(frame);
+    const normalized = try normalizePidForTest(alloc, frame);
+    defer alloc.free(normalized);
+    try testing.expectEqualStrings(
         "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":0,\"activity\":null},\"nonce\":\"nonce\"}",
         normalized,
     );
 }
 
 test "activityFrameJson: encodes the Discord payload shape" {
-    const frame = try activityFrameJson(std.testing.allocator, .{
+    const alloc = testing.allocator;
+    const frame = try activityFrameJson(alloc, .{
         .details = "Track",
         .state = "Album (2024)",
         .assets = .{
@@ -560,10 +564,10 @@ test "activityFrameJson: encodes the Discord payload shape" {
         },
         .timestamps = .{ .start = 1000, .end = 2000 },
     }, "nonce");
-    defer std.testing.allocator.free(frame);
-    const normalized = try normalizePidForTest(std.testing.allocator, frame);
-    defer std.testing.allocator.free(normalized);
-    try std.testing.expectEqualStrings(
+    defer alloc.free(frame);
+    const normalized = try normalizePidForTest(alloc, frame);
+    defer alloc.free(normalized);
+    try testing.expectEqualStrings(
         "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":0,\"activity\":{\"type\":2," ++
             "\"details\":\"Track\",\"state\":\"Album (2024)\",\"assets\":{" ++
             "\"large_image\":\"logo-dark\",\"large_text\":\"Artist\"," ++
@@ -581,9 +585,11 @@ fn normalizePidForTest(alloc: Allocator, input: []const u8) ![]u8 {
 }
 
 test "readFrame: consecutive frames survive fresh transport readers" {
-    var tmp = std.testing.tmpDir(.{});
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const io = std.testing.io;
+
     try tmp.dir.writeFile(io, .{
         .sub_path = "frames",
         .data = "\x01\x00\x00\x00\x03\x00\x00\x00one" ++
@@ -591,56 +597,88 @@ test "readFrame: consecutive frames survive fresh transport readers" {
     });
     var conn: IpcConn = .{ .file = try tmp.dir.openFile(io, "frames", .{}) };
     defer conn.close(io);
-    const first = try conn.readFrame(std.testing.allocator, io);
-    defer std.testing.allocator.free(first.payload);
-    const second = try conn.readFrame(std.testing.allocator, io);
-    defer std.testing.allocator.free(second.payload);
-    try std.testing.expectEqual(.frame, first.opcode);
-    try std.testing.expectEqualStrings("one", first.payload);
-    try std.testing.expectEqualStrings("two", second.payload);
+
+    const first = try conn.readFrame(alloc, io);
+    defer alloc.free(first.payload);
+    const second = try conn.readFrame(alloc, io);
+    defer alloc.free(second.payload);
+
+    try testing.expectEqual(.frame, first.opcode);
+    try testing.expectEqualStrings("one", first.payload);
+    try testing.expectEqualStrings("two", second.payload);
 }
 
 test "readFrameFrom: rejects oversized unknown and truncated frames" {
+    const alloc = testing.allocator;
+
     var oversized = Io.Reader.fixed("\x01\x00\x00\x00\x01\x00\x10\x00");
-    try std.testing.expectError(error.FrameTooLarge, IpcConn.readFrameFrom(std.testing.allocator, &oversized));
+    try testing.expectError(error.FrameTooLarge, IpcConn.readFrameFrom(alloc, &oversized));
+
     var unknown = Io.Reader.fixed("\xff\x00\x00\x00\x00\x00\x00\x00");
-    try std.testing.expectError(error.InvalidResponse, IpcConn.readFrameFrom(std.testing.allocator, &unknown));
+    try testing.expectError(error.InvalidResponse, IpcConn.readFrameFrom(alloc, &unknown));
+
     var truncated = Io.Reader.fixed("\x01\x00\x00\x00\x03\x00\x00\x00a");
-    try std.testing.expectError(error.EndOfStream, IpcConn.readFrameFrom(std.testing.allocator, &truncated));
+    try testing.expectError(error.EndOfStream, IpcConn.readFrameFrom(alloc, &truncated));
 }
 
 test "ipcPathInBase: missing socket frees its path" {
-    var tmp = std.testing.tmpDir(.{});
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const length = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    try std.testing.expectEqual(null, try ipcPathInBase(std.testing.allocator, std.testing.io, path_buffer[0..length]));
+    const length = try tmp.dir.realPath(io, &path_buffer);
+    const base = path_buffer[0..length];
+
+    try testing.expectEqual(null, try ipcPathInBase(testing.allocator, io, base));
 }
 
 test "validateResponse: requires READY or the matching successful command" {
-    const alloc = std.testing.allocator;
-    try validateResponse(alloc, "{\"cmd\":\"DISPATCH\",\"evt\":\"READY\",\"data\":{}}", null);
-    try validateResponse(alloc, "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"abc\",\"data\":{}}", "abc");
-    try validateResponse(alloc, "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"abc\",\"evt\":null,\"data\":null}", "abc");
-    try std.testing.expectError(error.CommandRejected, validateResponse(alloc, "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"abc\",\"evt\":\"ERROR\",\"data\":{\"code\":4000}}", "abc"));
-    try std.testing.expectError(error.InvalidResponse, validateResponse(alloc, "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"other\",\"data\":{}}", "abc"));
-    try std.testing.expectError(error.InvalidResponse, validateResponse(alloc, "{\"cmd\":\"DISPATCH\",\"evt\":\"READY\",\"data\":{}}", "abc"));
-    try std.testing.expectError(error.InvalidResponse, validateResponse(alloc, "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"abc\",\"data\":{}}", null));
-    try std.testing.expectError(error.InvalidResponse, validateResponse(alloc, "not json", "abc"));
-    try std.testing.expectError(error.InvalidResponse, validateResponse(alloc, "{}", "abc"));
-    try std.testing.expectError(error.EmptyResponse, validateResponse(alloc, "", null));
+    const alloc = testing.allocator;
+
+    try validateResponse(alloc,
+        \\{"cmd":"DISPATCH","evt":"READY","data":{}}
+    , null);
+    try validateResponse(alloc,
+        \\{"cmd":"SET_ACTIVITY","nonce":"abc","data":{}}
+    , "abc");
+    try validateResponse(alloc,
+        \\{"cmd":"SET_ACTIVITY","nonce":"abc","evt":null,"data":null}
+    , "abc");
+
+    try testing.expectError(error.CommandRejected, validateResponse(alloc,
+        \\{"cmd":"SET_ACTIVITY","nonce":"abc","evt":"ERROR","data":{"code":4000}}
+    , "abc"));
+
+    // A mismatched nonce.
+    try testing.expectError(error.InvalidResponse, validateResponse(alloc,
+        \\{"cmd":"SET_ACTIVITY","nonce":"other","data":{}}
+    , "abc"));
+    // READY in place of a command reply, and the reverse.
+    try testing.expectError(error.InvalidResponse, validateResponse(alloc,
+        \\{"cmd":"DISPATCH","evt":"READY","data":{}}
+    , "abc"));
+    try testing.expectError(error.InvalidResponse, validateResponse(alloc,
+        \\{"cmd":"SET_ACTIVITY","nonce":"abc","data":{}}
+    , null));
+
+    try testing.expectError(error.InvalidResponse, validateResponse(alloc, "not json", "abc"));
+    try testing.expectError(error.InvalidResponse, validateResponse(alloc, "{}", "abc"));
+    try testing.expectError(error.EmptyResponse, validateResponse(alloc, "", null));
 }
 
 test "exchange: socket preserves consecutive frames and answers ping" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = try tmp.dir.realPath(io, &path_buffer);
     const path = try std.fs.path.join(alloc, &.{ path_buffer[0..length], "ipc" });
     defer alloc.free(path);
+
     const address = try Io.net.UnixAddress.init(path);
     var server = try address.listen(io, .{});
     defer server.deinit(io);
@@ -648,60 +686,80 @@ test "exchange: socket preserves consecutive frames and answers ping" {
     defer conn.close(io);
     var peer: IpcConn = .{ .stream = try server.accept(io) };
     defer peer.close(io);
+
     try peer.writeFrame(io, "\x03\x00\x00\x00\x04\x00\x00\x00", "ping");
     try peer.writeFrame(io, "\x01\x00\x00\x00\x03\x00\x00\x00", "one");
     try peer.writeFrame(io, "\x01\x00\x00\x00\x03\x00\x00\x00", "two");
+
     const response = try conn.exchange(alloc, io, .frame, "request");
     defer alloc.free(response);
-    try std.testing.expectEqualStrings("one", response);
+    try testing.expectEqualStrings("one", response);
+
     const second = try conn.readFrame(alloc, io);
     defer alloc.free(second.payload);
-    try std.testing.expectEqualStrings("two", second.payload);
+    try testing.expectEqualStrings("two", second.payload);
+
     const request = try peer.readFrame(alloc, io);
     defer alloc.free(request.payload);
-    try std.testing.expectEqualStrings("request", request.payload);
+    try testing.expectEqualStrings("request", request.payload);
+
     const pong = try peer.readFrame(alloc, io);
     defer alloc.free(pong.payload);
-    try std.testing.expectEqual(.pong, pong.opcode);
-    try std.testing.expectEqualStrings("ping", pong.payload);
+    try testing.expectEqual(.pong, pong.opcode);
+    try testing.expectEqualStrings("ping", pong.payload);
 }
 
 test "Client: command rejection retains connection but malformed reply closes it" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = try tmp.dir.realPath(io, &path_buffer);
     const path = try std.fs.path.join(alloc, &.{ path_buffer[0..length], "ipc" });
     defer alloc.free(path);
+
     const address = try Io.net.UnixAddress.init(path);
     var server = try address.listen(io, .{});
     defer server.deinit(io);
+
     var environ = std.process.Environ.Map.init(alloc);
     defer environ.deinit();
     var client = Client.init(alloc, io, &environ);
     defer client.logout();
     client.conn = .{ .stream = try address.connect(io) };
     const peer = try server.accept(io);
+
+    // Rejects the first command, then answers the second with garbage.
     const Peer = struct {
         fn respond(stream: Io.net.Stream) !void {
             var conn: IpcConn = .{ .stream = stream };
-            defer conn.close(std.testing.io);
-            const request = try conn.readFrame(std.testing.allocator, std.testing.io);
-            defer std.testing.allocator.free(request.payload);
-            const parsed = try std.json.parseFromSlice(struct { nonce: []const u8 }, std.testing.allocator, request.payload, .{ .ignore_unknown_fields = true });
+            defer conn.close(io);
+
+            const request = try conn.readFrame(alloc, io);
+            defer alloc.free(request.payload);
+            const parsed = try std.json.parseFromSlice(
+                struct { nonce: []const u8 },
+                alloc,
+                request.payload,
+                .{ .ignore_unknown_fields = true },
+            );
             defer parsed.deinit();
-            const response = try std.fmt.allocPrint(std.testing.allocator, "{{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"{s}\",\"evt\":\"ERROR\",\"data\":{{\"code\":4000}}}}", .{parsed.value.nonce});
-            defer std.testing.allocator.free(response);
-            var header: [8]u8 = undefined;
-            std.mem.writeInt(u32, header[0..4], 1, .little);
+
+            const response = try std.fmt.allocPrint(alloc,
+                \\{{"cmd":"SET_ACTIVITY","nonce":"{s}","evt":"ERROR","data":{{"code":4000}}}}
+            , .{parsed.value.nonce});
+            defer alloc.free(response);
+            var header: [IpcConn.frame_header_len]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], @intFromEnum(Opcode.frame), .little);
             std.mem.writeInt(u32, header[4..8], @intCast(response.len), .little);
-            try conn.writeFrame(std.testing.io, &header, response);
-            const retry = try conn.readFrame(std.testing.allocator, std.testing.io);
-            defer std.testing.allocator.free(retry.payload);
-            try conn.writeFrame(std.testing.io, "\x01\x00\x00\x00\x03\x00\x00\x00", "bad");
+            try conn.writeFrame(io, &header, response);
+
+            const retry = try conn.readFrame(alloc, io);
+            defer alloc.free(retry.payload);
+            try conn.writeFrame(io, "\x01\x00\x00\x00\x03\x00\x00\x00", "bad");
         }
     };
     var task = io.concurrent(Peer.respond, .{peer}) catch |err| {
@@ -709,10 +767,11 @@ test "Client: command rejection retains connection but malformed reply closes it
         return err;
     };
     defer task.cancel(io) catch {};
-    try std.testing.expectError(error.CommandRejected, client.setActivity(.{}));
-    try std.testing.expect(client.conn != null);
-    try std.testing.expectError(error.InvalidResponse, client.clearActivity());
-    try std.testing.expectEqual(null, client.conn);
-    try std.testing.expectError(error.NotConnected, client.setActivity(.{}));
+
+    try testing.expectError(error.CommandRejected, client.setActivity(.{}));
+    try testing.expect(client.conn != null);
+    try testing.expectError(error.InvalidResponse, client.clearActivity());
+    try testing.expectEqual(null, client.conn);
+    try testing.expectError(error.NotConnected, client.setActivity(.{}));
     try task.await(io);
 }

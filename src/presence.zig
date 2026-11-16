@@ -18,6 +18,7 @@ const lyra = @import("lyra.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const assert = std.debug.assert;
+const testing = std.testing;
 
 pub const TemplateError = error{InvalidPresenceTemplate};
 
@@ -283,41 +284,44 @@ fn compactEmptyParenthesizedGroups(input: []u8) usize {
 }
 
 test "render: default templates" {
+    const alloc = testing.allocator;
     const release: lyra.Release = .{
         .title = "Album",
         .release_date = "2024-05-01",
     };
-    var text = try render(std.testing.allocator, .{}, .{
+    var text = try render(alloc, .{}, .{
         .track = .{ .id = "track", .title = "Song" },
         .release = release,
         .artists = "Artist One, Artist Two",
     });
-    defer text.deinit(std.testing.allocator);
+    defer text.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Song", text.title);
-    try std.testing.expectEqualStrings("Album (2024)", text.subtitle);
-    try std.testing.expectEqualStrings("Artist One, Artist Two", text.image_text);
+    try testing.expectEqualStrings("Song", text.title);
+    try testing.expectEqualStrings("Album (2024)", text.subtitle);
+    try testing.expectEqualStrings("Artist One, Artist Two", text.image_text);
 }
 
 test "render: empty parenthesized groups are removed" {
-    var text = try render(std.testing.allocator, .{}, .{
+    const alloc = testing.allocator;
+    var text = try render(alloc, .{}, .{
         .track = .{ .title = "Song" },
         .release = .{ .title = "Album" },
         .artists = "Artist",
     });
-    defer text.deinit(std.testing.allocator);
+    defer text.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Album", text.subtitle);
+    try testing.expectEqualStrings("Album", text.subtitle);
 
-    var cleaned = try std.testing.allocator.dupe(u8, "A () B");
-    defer std.testing.allocator.free(cleaned);
+    var cleaned = try alloc.dupe(u8, "A () B");
+    defer alloc.free(cleaned);
     const cleaned_len = compactEmptyParenthesizedGroups(cleaned);
-    try std.testing.expectEqualStrings("A B", cleaned[0..cleaned_len]);
+    try testing.expectEqualStrings("A B", cleaned[0..cleaned_len]);
 }
 
 test "render: hardcoded text and every placeholder" {
+    const alloc = testing.allocator;
     const genres = [_][]const u8{ "Rock", "Pop" };
-    var text = try render(std.testing.allocator, .{
+    var text = try render(alloc, .{
         .title = "Lyra",
         .subtitle = "{release.date} - {release.artists} - {release.genres}",
         .image_text = "{track.id} {track.year} {track.disc}.{track.number} {track.duration}",
@@ -334,28 +338,29 @@ test "render: hardcoded text and every placeholder" {
         .release_artists = "Release Artist",
         .release_genres = "Rock, Pop",
     });
-    defer text.deinit(std.testing.allocator);
+    defer text.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Lyra", text.title);
-    try std.testing.expectEqualStrings("2024-05-01 - Release Artist - Rock, Pop", text.subtitle);
-    try std.testing.expectEqualStrings("track 2024 2.7 3:42", text.image_text);
+    try testing.expectEqualStrings("Lyra", text.title);
+    try testing.expectEqualStrings("2024-05-01 - Release Artist - Rock, Pop", text.subtitle);
+    try testing.expectEqualStrings("track 2024 2.7 3:42", text.image_text);
 }
 
 test "render: duration with hours" {
-    var text = try render(std.testing.allocator, .{
+    const alloc = testing.allocator;
+    var text = try render(alloc, .{
         .title = "{track.duration}",
     }, .{
         .track = .{ .duration_ms = 3_784_000 },
     });
-    defer text.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("1:03:04", text.title);
+    defer text.deinit(alloc);
+    try testing.expectEqualStrings("1:03:04", text.title);
 }
 
 test "validate: unknown placeholder and unclosed brace" {
-    try std.testing.expectError(error.InvalidPresenceTemplate, validate(.{
+    try testing.expectError(error.InvalidPresenceTemplate, validate(.{
         .title = "{bad.placeholder}",
     }));
-    try std.testing.expectError(error.InvalidPresenceTemplate, validate(.{
+    try testing.expectError(error.InvalidPresenceTemplate, validate(.{
         .subtitle = "{track.title",
     }));
     try validate(.{});
@@ -363,26 +368,26 @@ test "validate: unknown placeholder and unclosed brace" {
 
 test "inputs: tracks the placeholders each template needs" {
     const defaults = inputs(.{});
-    try std.testing.expect(defaults.track_artists);
-    try std.testing.expect(defaults.release);
-    try std.testing.expect(!defaults.release_artists);
-    try std.testing.expect(!defaults.release_genres);
+    try testing.expect(defaults.track_artists);
+    try testing.expect(defaults.release);
+    try testing.expect(!defaults.release_artists);
+    try testing.expect(!defaults.release_genres);
 
     const hardcoded = inputs(.{
         .title = "Lyra",
         .subtitle = "Playing",
         .image_text = "Music",
     });
-    try std.testing.expect(!hardcoded.track_artists);
-    try std.testing.expect(!hardcoded.release);
+    try testing.expect(!hardcoded.track_artists);
+    try testing.expect(!hardcoded.release);
 
     const release_lists = inputs(.{
         .subtitle = "{release.artists} / {release.genres}",
     });
-    try std.testing.expect(release_lists.release);
-    try std.testing.expect(release_lists.release_artists);
-    try std.testing.expect(release_lists.release_genres);
-    try std.testing.expect(release_lists.releaseLookupIncludes().contains(.{
+    try testing.expect(release_lists.release);
+    try testing.expect(release_lists.release_artists);
+    try testing.expect(release_lists.release_genres);
+    try testing.expect(release_lists.releaseLookupIncludes().contains(.{
         .artists = true,
         .genres = true,
     }));
