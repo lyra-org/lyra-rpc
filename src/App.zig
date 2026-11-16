@@ -267,6 +267,13 @@ pub const ApiError = HttpError ||
     std.json.ParseError(std.json.Scanner) ||
     error{ UnexpectedApiStatus, ReleaseNotFound };
 
+pub const UploadError = ApiError || error{ImageUploadsDisabled};
+
+pub const UpdateError = ApiError ||
+    presence.RenderError ||
+    discordpkg.Client.Error ||
+    error{MissingCachedTrack};
+
 pub fn init(
     alloc: Allocator,
     io: Io,
@@ -472,7 +479,7 @@ fn uploadCover(
     self: *App,
     release_id: []const u8,
     includes: lyra.ReleaseLookupIncludes,
-) ![]const u8 {
+) UploadError![]const u8 {
     if (self.config.images.uploader == .none) return error.ImageUploadsDisabled;
     if (self.cover_cache.get(release_id)) |url| return url;
     if (self.missing_cover_cache.contains(release_id)) return "";
@@ -513,7 +520,7 @@ fn rememberMissingCover(self: *App, release_id: []const u8) Allocator.Error!void
     try self.missing_cover_cache.put(self.alloc, key, {});
 }
 
-fn uploadToLitterbox(self: *App, image: []const u8) ![]u8 {
+fn uploadToLitterbox(self: *App, image: []const u8) ApiError![]u8 {
     var resp = try self.postMultipart(litterbox_api_url, &.{
         .{ .name = "reqtype", .value = "fileupload" },
         .{ .name = "time", .value = "72h" },
@@ -524,7 +531,7 @@ fn uploadToLitterbox(self: *App, image: []const u8) ![]u8 {
     return self.alloc.dupe(u8, std.mem.trim(u8, resp.body, &std.ascii.whitespace));
 }
 
-fn uploadToImgur(self: *App, image: []const u8) ![]u8 {
+fn uploadToImgur(self: *App, image: []const u8) ApiError![]u8 {
     var resp = try self.postMultipart(imgur_api_url, &.{
         .{ .name = "type", .value = "file" },
     }, "image", image, self.imgur_auth_header);
@@ -545,7 +552,7 @@ fn postMultipart(
     file_field_name: []const u8,
     file_data: []const u8,
     authorization: ?[]const u8,
-) !HttpResponse {
+) HttpError!HttpResponse {
     var payload_writer: Io.Writer.Allocating = .init(self.alloc);
     defer payload_writer.deinit();
 
@@ -591,7 +598,11 @@ fn clearPresence(self: *App) void {
     self.clearCachedTrack();
 }
 
-fn updatePresence(self: *App, playback: lyra.CurrentPlayback, snapshot_now: Io.Timestamp) !void {
+fn updatePresence(
+    self: *App,
+    playback: lyra.CurrentPlayback,
+    snapshot_now: Io.Timestamp,
+) UpdateError!void {
     const timestamps = playbackTimestamps(playback, snapshot_now);
     if (self.cachedTrack(playback.track_id) != null and self.cover_retry.due(snapshot_now)) {
         self.loadCover(snapshot_now);

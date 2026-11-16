@@ -18,6 +18,9 @@ pub const json_parse_options: std.json.ParseOptions = .{
     .allocate = .alloc_always,
 };
 
+/// Errors from building a string in an allocating writer.
+pub const FormatError = Allocator.Error || Io.Writer.Error;
+
 pub const PlaybackPage = struct {
     items: []Playback,
     next_cursor: ?[]const u8,
@@ -188,7 +191,7 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-pub fn playbackLogLine(alloc: Allocator, state: PlaybackState, track: Track) ![]u8 {
+pub fn playbackLogLine(alloc: Allocator, state: PlaybackState, track: Track) FormatError![]u8 {
     const artist_names = try displayArtistNames(alloc, trackArtists(track));
     defer alloc.free(artist_names);
 
@@ -231,7 +234,7 @@ pub const ApiStatusError = struct {
     }
 };
 
-pub fn activePlaybackPath(alloc: Allocator, cursor: ?[]const u8) ![]u8 {
+pub fn activePlaybackPath(alloc: Allocator, cursor: ?[]const u8) FormatError![]u8 {
     var out: Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -243,7 +246,7 @@ pub fn activePlaybackPath(alloc: Allocator, cursor: ?[]const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-pub fn trackLookupPath(alloc: Allocator, track_id: []const u8) ![]u8 {
+pub fn trackLookupPath(alloc: Allocator, track_id: []const u8) FormatError![]u8 {
     var out: Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -277,7 +280,7 @@ pub fn releaseLookupPath(
     alloc: Allocator,
     release_id: []const u8,
     includes: ReleaseLookupIncludes,
-) ![]u8 {
+) FormatError![]u8 {
     var out: Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
