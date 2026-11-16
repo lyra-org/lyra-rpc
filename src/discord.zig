@@ -3,6 +3,14 @@
 // file, You can obtain one here:
 // www.meshiplaw.com/lyra.
 
+//! Discord rich presence over the local IPC transport: a Unix socket on
+//! POSIX systems, a named pipe on Windows.
+//!
+//! Every message is a frame of two little-endian `u32`s (opcode, payload
+//! length) followed by a JSON payload. The client sends a handshake, waits
+//! for READY, then issues `SET_ACTIVITY` commands, each matched to its
+//! reply by nonce.
+
 const std = @import("std");
 const builtin = @import("builtin");
 

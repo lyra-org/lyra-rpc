@@ -3,6 +3,9 @@
 // file, You can obtain one here:
 // www.meshiplaw.com/lyra.
 
+//! Entry point. Loads `config.json`, connects to Discord and polls Lyra
+//! until interrupted.
+
 const std = @import("std");
 const builtin = @import("builtin");
 

@@ -3,6 +3,9 @@
 // file, You can obtain one here:
 // www.meshiplaw.com/lyra.
 
+//! Types and helpers for the parts of the Lyra HTTP API this program
+//! reads: active playbacks, tracks and releases.
+
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;

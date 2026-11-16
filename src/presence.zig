@@ -3,6 +3,14 @@
 // file, You can obtain one here:
 // www.meshiplaw.com/lyra.
 
+//! Renders the presence text from user templates.
+//!
+//! A template is literal text with `{placeholder}` markers such as
+//! `{track.title}` or `{release.year}`. Braces cannot be escaped, and an
+//! unknown placeholder or unclosed brace is rejected. Placeholders with no
+//! value expand to nothing, and a parenthesized group left empty by that
+//! is dropped.
+
 const std = @import("std");
 const Config = @import("Config.zig");
 const lyra = @import("lyra.zig");

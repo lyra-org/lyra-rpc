@@ -3,6 +3,13 @@
 // file, You can obtain one here:
 // www.meshiplaw.com/lyra.
 
+//! Mirrors the active Lyra playback into Discord rich presence.
+//!
+//! Each `poll` fetches the current playback, loads and caches the track,
+//! release and cover it refers to, and publishes an activity only when
+//! something visible changed. A failed publication leaves the last
+//! published state untouched so the next poll retries it.
+
 const App = @This();
 
 const std = @import("std");

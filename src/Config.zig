@@ -3,6 +3,9 @@
 // file, You can obtain one here:
 // www.meshiplaw.com/lyra.
 
+//! User configuration, read from a JSON file. Every field has a default,
+//! so a missing file or a partial one is valid.
+
 const Config = @This();
 
 const std = @import("std");
